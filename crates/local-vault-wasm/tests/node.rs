@@ -3,7 +3,7 @@
 
 #![cfg(target_arch = "wasm32")]
 
-use js_sys::{JSON, Reflect};
+use js_sys::{JSON, Promise, Reflect};
 use local_vault_wasm::{JsFileSystem, JsPlatform, WasmLocalServer};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
@@ -65,6 +65,27 @@ export function unreachableFileSystem() {
   return { list: fail, exists: fail, read: fail, write: fail, rename: fail, delete: fail };
 }
 
+// Bytes from another realm, which are not an instance of the Uint8Array here: what Jest gives
+// a test, which runs in a context of its own, where Node makes them.
+async function foreign(bytes) {
+  const vm = await import("node:vm");
+  return vm.runInNewContext("Uint8Array.from(values)", { values: [...bytes] });
+}
+
+export function foreignFileSystem() {
+  const fileSystem = memoryFileSystem();
+  const read = fileSystem.read;
+  fileSystem.read = async (path) => {
+    const content = await read(path);
+    return content === null ? null : await foreign(content);
+  };
+  return fileSystem;
+}
+
+export async function withForeignBody(request) {
+  return { ...request, body: await foreign(request.body) };
+}
+
 export function testPlatform() {
   let next = 0;
   return {
@@ -88,6 +109,8 @@ export function request(method, path, body, accessToken, form) {
 extern "C" {
     fn memoryFileSystem() -> JsFileSystem;
     fn unreachableFileSystem() -> JsFileSystem;
+    fn foreignFileSystem() -> JsFileSystem;
+    fn withForeignBody(request: JsValue) -> Promise;
     fn testPlatform() -> JsPlatform;
     fn request(method: &str, path: &str, body: JsValue, token: JsValue, form: JsValue) -> JsValue;
 }
@@ -154,6 +177,25 @@ async fn an_account_is_registered_and_synced_on_the_file_system_of_the_extension
     let sync = parse(&field(&response, "json").as_string().unwrap());
     let email = field(&field(&sync, "profile"), "email");
     assert_eq!(email.as_string().as_deref(), Some("user@example.com"));
+}
+
+#[wasm_bindgen_test]
+async fn bytes_from_another_realm_are_read() {
+    let server = server(foreignFileSystem());
+    let none = JsValue::UNDEFINED;
+    let path = "accounts/register/finish";
+    let body = parse(REGISTRATION);
+    let registration = request("POST", path, body, none.clone(), none.clone());
+    let registration = JsFuture::from(withForeignBody(registration)).await.unwrap();
+
+    let registered = handle(&server, registration).await.unwrap();
+    let form = parse(LOGIN);
+    let login = request("POST", "connect/token", none.clone(), none, form);
+    let login = handle(&server, login).await.unwrap();
+
+    // The body of the request is the account, and the vault folder has it when it is read.
+    assert_eq!(field(&registered, "code").as_f64(), Some(200.0));
+    assert_eq!(field(&login, "code").as_f64(), Some(200.0));
 }
 
 #[wasm_bindgen_test]

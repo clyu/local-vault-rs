@@ -121,7 +121,7 @@ impl WasmLocalServer {
     pub fn new(
         file_system: JsFileSystem,
         platform: JsPlatform,
-        client: &str,
+        #[wasm_bindgen(unchecked_param_type = "\"browser\" | \"android\"")] client: &str,
     ) -> Result<WasmLocalServer, JsError> {
         let client = match client {
             "android" => ClientKind::Android,
@@ -138,7 +138,11 @@ impl WasmLocalServer {
     /// Answers a `LocalVaultRequest` with a `LocalVaultResponse`. Requests are handled one at a
     /// time: one that comes while another one is handled waits for it. Rejects with an error
     /// named `LocalVaultIoError` if the vault folder cannot be reached, and with nothing else.
-    pub fn handle(&self, request: JsValue) -> Promise {
+    #[wasm_bindgen(unchecked_return_type = "Promise<LocalVaultResponse>")]
+    pub fn handle(
+        &self,
+        #[wasm_bindgen(unchecked_param_type = "LocalVaultRequest")] request: JsValue,
+    ) -> Promise {
         let server = Rc::clone(&self.server);
         future_to_promise(async move {
             let request = to_request(&request)?;
@@ -179,12 +183,7 @@ fn to_request(value: &JsValue) -> Result<LocalRequest, JsValue> {
         .iter()
         .filter_map(|segment| segment.as_string())
         .collect();
-    let body = field("body")?;
-    let body = if body.is_instance_of::<Uint8Array>() {
-        Uint8Array::new(&body).to_vec()
-    } else {
-        Vec::new()
-    };
+    let body = bytes(&field("body")?).unwrap_or_default();
     Ok(LocalRequest {
         method,
         path,
@@ -195,12 +194,21 @@ fn to_request(value: &JsValue) -> Result<LocalRequest, JsValue> {
     })
 }
 
+/// The bytes of a `Uint8Array`, or `None` if the value is not an object.
+///
+/// Values are told apart by what they are and not by their class: one from another realm is not
+/// an instance of the classes here. Jest runs a test in a context of its own, where what Node
+/// makes, such as the bytes from a `TextEncoder`, is from the realm outside of it.
+fn bytes(value: &JsValue) -> Option<Vec<u8>> {
+    value.is_object().then(|| Uint8Array::new(value).to_vec())
+}
+
 fn to_map(value: &JsValue) -> HashMap<String, String> {
-    let Some(object) = value.dyn_ref::<Object>() else {
+    if !value.is_object() {
         return HashMap::new();
-    };
+    }
     let mut map = HashMap::new();
-    for entry in Object::entries(object).iter() {
+    for entry in Object::entries(value.unchecked_ref()).iter() {
         let entry = Array::from(&entry);
         if let (Some(key), Some(value)) = (entry.get(0).as_string(), entry.get(1).as_string()) {
             map.insert(key, value);
@@ -275,10 +283,7 @@ impl FileSystem for HostFileSystem {
 
     async fn read(&self, path: &[&str]) -> Result<Option<Vec<u8>>, IoError> {
         let content = settle(self.0.read(&to_array(path))).await?;
-        if !content.is_instance_of::<Uint8Array>() {
-            return Ok(None);
-        }
-        Ok(Some(Uint8Array::new(&content).to_vec()))
+        Ok(bytes(&content))
     }
 
     async fn write(&self, path: &[&str], content: &[u8]) -> Result<(), IoError> {
