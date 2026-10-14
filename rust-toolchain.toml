@@ -1,0 +1,6 @@
+# The toolchain that this repository is built and checked with. The jobs that build for Android
+# and for WebAssembly add their targets to it.
+[toolchain]
+channel = "1.90.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

@@ -1,0 +1,18 @@
+[package]
+name = "local-vault-uniffi"
+description = "The local vault for Kotlin, through UniFFI."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "local_vault_uniffi"
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+futures = { workspace = true, features = ["std", "executor"] }
+getrandom = "0.3"
+local-vault.workspace = true
+uniffi.workspace = true

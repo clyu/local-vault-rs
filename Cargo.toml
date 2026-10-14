@@ -1,0 +1,41 @@
+[workspace]
+members = [
+    "crates/local-vault",
+    "crates/local-vault-uniffi",
+    "crates/local-vault-wasm",
+    "crates/uniffi-bindgen",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "GPL-3.0-only"
+publish = false
+
+[workspace.dependencies]
+local-vault = { path = "crates/local-vault" }
+base64 = "0.22"
+futures = { version = "0.3", default-features = false }
+js-sys = "0.3"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+serde = "1"
+serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision"] }
+sha2 = "0.10"
+subtle = "2.6"
+uniffi = "0.29"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+wasm-bindgen-test = "0.3"
+
+# Every password verifier is 100 000 rounds of SHA-256, which the tests make many of. Without
+# optimizations they take most of the time of the tests.
+[profile.dev.package.sha2]
+opt-level = 3
+
+[profile.release]
+# The libraries are loaded by apps, where their size counts.
+opt-level = "s"
+lto = true
+codegen-units = 1

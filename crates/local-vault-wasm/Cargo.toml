@@ -1,0 +1,25 @@
+[package]
+name = "local-vault-wasm"
+description = "The local vault for JavaScript, through WebAssembly."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "local_vault_wasm"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+js-sys.workspace = true
+local-vault.workspace = true
+wasm-bindgen.workspace = true
+wasm-bindgen-futures.workspace = true
+
+[dev-dependencies]
+wasm-bindgen-test.workspace = true
+
+[package.metadata.wasm-pack.profile.release]
+# The optimizer of wasm-pack is downloaded when it runs, which a build should not depend on.
+wasm-opt = false

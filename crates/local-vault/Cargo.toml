@@ -1,0 +1,32 @@
+[package]
+name = "local-vault"
+description = "The local vault that stands in for the Bitwarden server in the decentralized Bitwarden clients."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+base64.workspace = true
+futures = { workspace = true, features = ["std"] }
+pbkdf2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+
+[dev-dependencies]
+futures = { workspace = true, features = ["std", "executor"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[lints.clippy]
+# A panic would take the app down, or leave the WebAssembly module unusable: the local server
+# answers with an error instead.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"

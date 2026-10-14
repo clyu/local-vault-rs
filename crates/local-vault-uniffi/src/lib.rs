@@ -1,0 +1,394 @@
+//! The local vault for Kotlin, through UniFFI.
+//!
+//! The Android app calls [`LocalVaultServer::handle`] from its HTTP client, on a thread of that
+//! client, and waits for the answer. The vault folder is reached through the [`VaultFileSystem`]
+//! that the app implements, which answers right away, so the server is driven to its end on the
+//! thread of the call.
+
+use std::collections::HashMap;
+use std::fmt::{self, Display, Formatter};
+use std::sync::Arc;
+
+use futures::executor::block_on;
+use local_vault::{
+    ClientKind, FileSystem, IoError, LocalRequest, LocalResponse, LocalServer, LogLevel, Platform,
+    ResponseBody,
+};
+
+uniffi::setup_scaffolding!();
+
+/// What can go wrong when the vault folder is used.
+#[derive(Debug, uniffi::Error)]
+pub enum LocalVaultError {
+    /// The vault folder could not be read or written. The app reports it as a request that did
+    /// not reach its server.
+    Io {
+        /// What failed.
+        reason: String,
+    },
+}
+
+impl Display for LocalVaultError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io { reason } => f.write_str(reason),
+        }
+    }
+}
+
+impl std::error::Error for LocalVaultError {}
+
+impl From<uniffi::UnexpectedUniFFICallbackError> for LocalVaultError {
+    fn from(error: uniffi::UnexpectedUniFFICallbackError) -> Self {
+        Self::Io {
+            reason: error.reason,
+        }
+    }
+}
+
+impl From<IoError> for LocalVaultError {
+    fn from(error: IoError) -> Self {
+        Self::Io {
+            reason: error.message().to_owned(),
+        }
+    }
+}
+
+/// The vault folder, as the app reaches it. Paths are lists of names relative to the folder.
+/// See [`local_vault::FileSystem`] for what each operation does.
+#[uniffi::export(callback_interface)]
+pub trait VaultFileSystem: Send + Sync {
+    /// The names of the entries of a directory, or none if it does not exist.
+    fn list(&self, directory: Vec<String>) -> Result<Vec<String>, LocalVaultError>;
+
+    /// Whether a file or a directory exists.
+    fn exists(&self, path: Vec<String>) -> Result<bool, LocalVaultError>;
+
+    /// The content of a file, or `null` if there is no file.
+    fn read(&self, path: Vec<String>) -> Result<Option<Vec<u8>>, LocalVaultError>;
+
+    /// Replaces the content of a file, creating the directories that are missing.
+    fn write(&self, path: Vec<String>, content: Vec<u8>) -> Result<(), LocalVaultError>;
+
+    /// Renames an entry within its directory. `false` if it was not renamed.
+    fn rename(&self, path: Vec<String>, new_name: String) -> Result<bool, LocalVaultError>;
+
+    /// Deletes an entry, with everything in it. `true` if nothing remains.
+    fn delete(&self, path: Vec<String>) -> Result<bool, LocalVaultError>;
+}
+
+/// What the local server needs of the app apart from the vault folder.
+#[uniffi::export(callback_interface)]
+pub trait VaultPlatform: Send + Sync {
+    /// The current time, in milliseconds since the epoch.
+    fn now_millis(&self) -> i64;
+
+    /// Logs a message, which never holds anything that is in a vault or in a request.
+    fn log(&self, level: VaultLogLevel, message: String);
+}
+
+/// How much something that the local server logs matters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum VaultLogLevel {
+    /// Something to look at, such as a request that is refused.
+    Warning,
+    /// Something that went wrong.
+    Error,
+}
+
+/// The client that the local server answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum VaultClientKind {
+    /// The Android app.
+    Android,
+    /// The browser extension.
+    Browser,
+}
+
+/// A request, as the app would have sent it to a Bitwarden server.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct VaultRequest {
+    /// The HTTP method, in upper case.
+    pub method: String,
+    /// The decoded segments of the path, relative to the service: `sync`, not `api/sync`.
+    pub path: Vec<String>,
+    /// The bearer token of the request, if any.
+    pub access_token: Option<String>,
+    /// The fields of the body, if it is a form.
+    pub form: HashMap<String, String>,
+    /// The parameters of the query.
+    pub query: HashMap<String, String>,
+    /// The body, which is left out of a request for the content of an attachment.
+    pub body: Vec<u8>,
+}
+
+/// The body of a response.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum VaultResponseBody {
+    /// No body.
+    Empty,
+    /// JSON.
+    Json {
+        /// The JSON.
+        json: String,
+    },
+    /// The content of the file at the path of the vault folder, which exists.
+    File {
+        /// The path of the file.
+        path: Vec<String>,
+    },
+}
+
+/// A response of the local server.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct VaultResponse {
+    /// The HTTP status code.
+    pub code: u16,
+    /// The body.
+    pub body: VaultResponseBody,
+    /// Where the app has to store the body of the request, as it comes in, before it gives the
+    /// response to its caller. A request whose body cannot be stored fails.
+    pub store_request_body_at: Option<Vec<String>>,
+}
+
+/// The local server, which answers the requests of the app in place of a Bitwarden server.
+#[derive(uniffi::Object)]
+pub struct LocalVaultServer {
+    server: LocalServer<AppFileSystem, AppPlatform>,
+}
+
+#[uniffi::export]
+impl LocalVaultServer {
+    /// A local server on the vault folder that the file system reaches.
+    #[uniffi::constructor]
+    pub fn new(
+        file_system: Box<dyn VaultFileSystem>,
+        platform: Box<dyn VaultPlatform>,
+        client: VaultClientKind,
+    ) -> Arc<Self> {
+        let client = match client {
+            VaultClientKind::Android => ClientKind::Android,
+            VaultClientKind::Browser => ClientKind::Browser,
+        };
+        let server = LocalServer::new(AppFileSystem(file_system), AppPlatform(platform), client);
+        Arc::new(Self { server })
+    }
+
+    /// Answers a request. Requests are handled one at a time: a call waits for the one before
+    /// it. Fails only if the vault folder cannot be reached.
+    pub fn handle(&self, request: VaultRequest) -> Result<VaultResponse, LocalVaultError> {
+        let request = LocalRequest {
+            method: request.method,
+            path: request.path,
+            access_token: request.access_token,
+            form: request.form,
+            query: request.query,
+            body: request.body,
+        };
+        let response = block_on(self.server.handle(&request))?;
+        Ok(to_vault_response(response))
+    }
+}
+
+/// Returns `true` if the name can be used as the name of a file or a directory in the vault
+/// folder: the local vault never uses another one.
+#[uniffi::export]
+pub fn is_safe_segment(name: String) -> bool {
+    local_vault::is_safe_segment(&name)
+}
+
+/// The host of the addresses of the local vault, which never resolves.
+#[uniffi::export]
+pub fn local_vault_host() -> String {
+    local_vault::LOCAL_VAULT_HOST.to_owned()
+}
+
+/// The first segment of the path of a request for the content of an attachment, whose body is
+/// not read by the local server but stored by the app.
+#[uniffi::export]
+pub fn attachments_path() -> String {
+    local_vault::ATTACHMENTS_PATH.to_owned()
+}
+
+fn to_vault_response(response: LocalResponse) -> VaultResponse {
+    let body = match response.body {
+        ResponseBody::Empty => VaultResponseBody::Empty,
+        ResponseBody::Json(json) => VaultResponseBody::Json { json },
+        ResponseBody::File(path) => VaultResponseBody::File { path },
+    };
+    VaultResponse {
+        code: response.code,
+        body,
+        store_request_body_at: response.store_request_body_at,
+    }
+}
+
+fn owned(path: &[&str]) -> Vec<String> {
+    path.iter().map(|name| (*name).to_owned()).collect()
+}
+
+fn io_error(error: LocalVaultError) -> IoError {
+    IoError::new(error.to_string())
+}
+
+/// The vault folder that the app reaches, as the local server uses it.
+struct AppFileSystem(Box<dyn VaultFileSystem>);
+
+impl FileSystem for AppFileSystem {
+    async fn list(&self, directory: &[&str]) -> Result<Vec<String>, IoError> {
+        self.0.list(owned(directory)).map_err(io_error)
+    }
+
+    async fn exists(&self, path: &[&str]) -> Result<bool, IoError> {
+        self.0.exists(owned(path)).map_err(io_error)
+    }
+
+    async fn read(&self, path: &[&str]) -> Result<Option<Vec<u8>>, IoError> {
+        self.0.read(owned(path)).map_err(io_error)
+    }
+
+    async fn write(&self, path: &[&str], content: &[u8]) -> Result<(), IoError> {
+        let content = content.to_vec();
+        self.0.write(owned(path), content).map_err(io_error)
+    }
+
+    async fn rename(&self, path: &[&str], new_name: &str) -> Result<bool, IoError> {
+        let new_name = new_name.to_owned();
+        self.0.rename(owned(path), new_name).map_err(io_error)
+    }
+
+    async fn delete(&self, path: &[&str]) -> Result<bool, IoError> {
+        self.0.delete(owned(path)).map_err(io_error)
+    }
+}
+
+/// The platform of the app, with the random bytes of the operating system.
+struct AppPlatform(Box<dyn VaultPlatform>);
+
+impl Platform for AppPlatform {
+    fn now_millis(&self) -> i64 {
+        self.0.now_millis()
+    }
+
+    fn random_bytes(&self, buffer: &mut [u8]) {
+        // The operating system always has random bytes for an app: there is nothing to do
+        // without them, as every salt and ID would be the same.
+        if let Err(error) = getrandom::fill(buffer) {
+            panic!("No random bytes: {error}");
+        }
+    }
+
+    fn log(&self, level: LogLevel, message: &str) {
+        let level = match level {
+            LogLevel::Warning => VaultLogLevel::Warning,
+            LogLevel::Error => VaultLogLevel::Error,
+        };
+        self.0.log(level, message.to_owned());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::FutureExt;
+    use local_vault::MemoryFileSystem;
+    use std::sync::Mutex;
+
+    /// The vault folder of a test, as an app would implement it: with calls that answer right
+    /// away, which the memory of a test does.
+    struct MemoryCallback(MemoryFileSystem);
+
+    fn strs(path: &[String]) -> Vec<&str> {
+        path.iter().map(String::as_str).collect()
+    }
+
+    /// Takes the result of a call of the file system of a test, which is ready at once. It must
+    /// not be waited for with an executor, as the server already runs in one.
+    fn ready<T>(call: impl Future<Output = Result<T, IoError>>) -> Result<T, LocalVaultError> {
+        match call.now_or_never() {
+            Some(result) => Ok(result?),
+            None => Err(LocalVaultError::Io {
+                reason: "The file system of the test is not ready.".to_owned(),
+            }),
+        }
+    }
+
+    impl VaultFileSystem for MemoryCallback {
+        fn list(&self, directory: Vec<String>) -> Result<Vec<String>, LocalVaultError> {
+            ready(self.0.list(&strs(&directory)))
+        }
+
+        fn exists(&self, path: Vec<String>) -> Result<bool, LocalVaultError> {
+            ready(self.0.exists(&strs(&path)))
+        }
+
+        fn read(&self, path: Vec<String>) -> Result<Option<Vec<u8>>, LocalVaultError> {
+            ready(self.0.read(&strs(&path)))
+        }
+
+        fn write(&self, path: Vec<String>, content: Vec<u8>) -> Result<(), LocalVaultError> {
+            ready(self.0.write(&strs(&path), &content))
+        }
+
+        fn rename(&self, path: Vec<String>, new_name: String) -> Result<bool, LocalVaultError> {
+            ready(self.0.rename(&strs(&path), &new_name))
+        }
+
+        fn delete(&self, path: Vec<String>) -> Result<bool, LocalVaultError> {
+            ready(self.0.delete(&strs(&path)))
+        }
+    }
+
+    struct Clock(Mutex<Vec<String>>);
+
+    impl VaultPlatform for Clock {
+        fn now_millis(&self) -> i64 {
+            1_791_720_000_000
+        }
+
+        fn log(&self, _level: VaultLogLevel, message: String) {
+            if let Ok(mut logs) = self.0.lock() {
+                logs.push(message);
+            }
+        }
+    }
+
+    fn request(method: &str, path: &[&str], body: &str) -> VaultRequest {
+        VaultRequest {
+            method: method.to_owned(),
+            path: owned(path),
+            access_token: None,
+            form: HashMap::new(),
+            query: HashMap::new(),
+            body: body.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn the_app_registers_and_reads_the_vault_through_its_own_file_system() {
+        let fs = MemoryFileSystem::new();
+        let file_system = Box::new(MemoryCallback(fs.clone()));
+        let platform = Box::new(Clock(Mutex::new(Vec::new())));
+        let server = LocalVaultServer::new(file_system, platform, VaultClientKind::Android);
+        let registration = r#"{
+            "email": "user@example.com",
+            "userAsymmetricKeys": {"publicKey": "a", "encryptedPrivateKey": "b"},
+            "masterPasswordAuthentication": {"masterPasswordAuthenticationHash": "aGFzaA=="},
+            "masterPasswordUnlock": {
+                "salt": "user@example.com",
+                "kdf": {"kdfType": 0, "iterations": 600000},
+                "masterKeyWrappedUserKey": "c"
+            }
+        }"#;
+
+        let register = ["accounts", "register", "finish"];
+        let registered = server.handle(request("POST", &register, registration));
+        let hint = r#"{"email": "user@example.com"}"#;
+        let hint = request("POST", &["accounts", "password-hint"], hint);
+        let hint = server.handle(hint);
+
+        assert_eq!(registered.ok().map(|response| response.code), Some(200));
+        assert_eq!(hint.ok().map(|response| response.code), Some(429));
+        assert_eq!(fs.paths().len(), 1);
+    }
+}

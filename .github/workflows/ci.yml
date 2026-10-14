@@ -1,0 +1,151 @@
+# Checks, tests and builds the local vault for every client that uses it: the Android app through
+# UniFFI, and the browser extension through WebAssembly. The clients build it again from the
+# submodule that they have it in; the builds here show that it builds for them at all.
+
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Format, lint and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # Installs the toolchain of rust-toolchain.toml.
+      - name: Print environment
+        run: |
+          rustup show
+          cargo --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Nothing on the machines that the code is written on runs rustfmt, so a run that finds
+      # code that rustfmt formats otherwise leaves the change as a patch: download the artifact
+      # and apply it with `git apply rustfmt.patch`.
+      - name: Check the formatting
+        id: fmt
+        run: cargo fmt --all -- --check
+
+      - name: Make a patch with the formatting
+        if: ${{ failure() && steps.fmt.outcome == 'failure' }}
+        run: |
+          cargo fmt --all
+          git diff > rustfmt.patch
+
+      - name: Upload the patch with the formatting
+        if: ${{ failure() && steps.fmt.outcome == 'failure' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: rustfmt-patch
+          path: rustfmt.patch
+
+      # Each of the checks that follow runs whatever the ones before it found.
+      - name: Lint
+        if: ${{ !cancelled() }}
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Test
+        if: ${{ !cancelled() }}
+        run: cargo test --locked --workspace
+
+  wasm:
+    name: WebAssembly for the browser extension
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Add the target
+        run: rustup target add wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack
+
+      - name: Lint
+        run: |
+          cargo clippy --locked -p local-vault-wasm --target wasm32-unknown-unknown --all-targets \
+            -- -D warnings
+
+      # The tests of the bindings themselves, in Node: those of the local server ran above.
+      - name: Test in Node
+        run: wasm-pack test --node crates/local-vault-wasm
+
+      - name: Build for webpack and for Node
+        run: |
+          wasm-pack build crates/local-vault-wasm --release --target bundler --out-dir ../../pkg/bundler
+          wasm-pack build crates/local-vault-wasm --release --target nodejs --out-dir ../../pkg/nodejs
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: local-vault-wasm
+          path: pkg/
+          if-no-files-found: error
+
+  android:
+    name: Libraries and Kotlin for the Android app
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Add the targets
+        run: |
+          rustup target add aarch64-linux-android armv7-linux-androideabi \
+            x86_64-linux-android i686-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      # The runner has the Android NDK, which cargo-ndk finds by ANDROID_NDK_HOME.
+      - name: Build for every ABI of Android
+        run: |
+          export ANDROID_NDK_HOME="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 -t x86 -o jniLibs \
+            build --locked --release -p local-vault-uniffi
+
+      # The Kotlin is generated from the library of the machine that runs the generator, which
+      # has the same interface as the ones for Android.
+      - name: Generate the Kotlin
+        run: |
+          cargo build --locked --release -p local-vault-uniffi
+          cargo run --locked --release -p uniffi-bindgen -- generate --no-format \
+            --library target/release/liblocal_vault_uniffi.so \
+            --language kotlin --out-dir kotlin
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: local-vault-android
+          path: |
+            jniLibs/
+            kotlin/
+          if-no-files-found: error
