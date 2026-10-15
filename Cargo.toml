@@ -17,9 +17,11 @@ publish = false
 [workspace.dependencies]
 local-vault = { path = "crates/local-vault" }
 base64 = "0.22"
+form_urlencoded = "1"
 futures = { version = "0.3", default-features = false }
 js-sys = "0.3"
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+percent-encoding = "2"
 serde = "1"
 serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision"] }
 sha2 = "0.10"

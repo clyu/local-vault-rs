@@ -9,8 +9,10 @@ publish.workspace = true
 
 [dependencies]
 base64.workspace = true
+form_urlencoded.workspace = true
 futures = { workspace = true, features = ["std"] }
 pbkdf2.workspace = true
+percent-encoding.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

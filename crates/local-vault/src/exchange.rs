@@ -5,6 +5,8 @@
 
 use std::collections::HashMap;
 
+use percent_encoding::percent_decode_str;
+
 use crate::fs::{FileSystem, IoError};
 use crate::http::{LocalRequest, ResponseBody};
 use crate::platform::Platform;
@@ -135,7 +137,7 @@ fn to_local_request(request: HttpRequest) -> LocalRequest {
     let is_form = header(&request, "Content-Type")
         .is_some_and(|value| value.to_ascii_lowercase().contains(FORM_MEDIA_TYPE));
     let form = if is_form {
-        parse_form(&String::from_utf8_lossy(&request.body))
+        parse_form(&request.body)
     } else {
         HashMap::new()
     };
@@ -143,7 +145,7 @@ fn to_local_request(request: HttpRequest) -> LocalRequest {
         .and_then(|value| value.strip_prefix(BEARER_PREFIX))
         .map(str::to_owned);
     let path = path_of(&request.url);
-    let query = parse_form(split_url(&request.url).query);
+    let query = parse_form(split_url(&request.url).query.as_bytes());
     LocalRequest {
         method: request.method.to_ascii_uppercase(),
         path,
@@ -221,50 +223,17 @@ fn path_of(url: &str) -> Vec<String> {
 /// A segment of a path with what is percent-encoded in it decoded. A segment that is not text
 /// once it is decoded is taken as it is, as the clients take it.
 fn decode_segment(segment: &str) -> String {
-    String::from_utf8(percent_decode(segment.as_bytes())).unwrap_or_else(|_| segment.to_owned())
+    percent_decode_str(segment)
+        .decode_utf8()
+        .map_or_else(|_| segment.to_owned(), |decoded| decoded.into_owned())
 }
 
-/// The names and the values of a form, or of the query of an address. Of a name that is there
-/// more than once, the last value counts.
-fn parse_form(text: &str) -> HashMap<String, String> {
-    text.split('&')
-        .filter(|pair| !pair.is_empty())
-        .map(|pair| {
-            let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
-            (decode_form_text(name), decode_form_text(value))
-        })
+/// The names and the values of a form, or of the query of an address, in which a `+` is a
+/// space. Of a name that is there more than once, the last value counts.
+fn parse_form(text: &[u8]) -> HashMap<String, String> {
+    form_urlencoded::parse(text)
+        .map(|(name, value)| (name.into_owned(), value.into_owned()))
         .collect()
-}
-
-/// A name or a value of a form, in which a `+` is a space.
-fn decode_form_text(text: &str) -> String {
-    let decoded = percent_decode(text.replace('+', " ").as_bytes());
-    String::from_utf8_lossy(&decoded).into_owned()
-}
-
-/// The bytes with every `%` and two hexadecimal digits replaced by the byte that they stand
-/// for. A `%` that is not followed by two of them stays.
-fn percent_decode(mut bytes: &[u8]) -> Vec<u8> {
-    let mut decoded = Vec::with_capacity(bytes.len());
-    while let [first, rest @ ..] = bytes {
-        let escaped = match rest {
-            [high, low, ..] if *first == b'%' => hex_digit(*high).zip(hex_digit(*low)),
-            _ => None,
-        };
-        if let (Some((high, low)), [_, _, after @ ..]) = (escaped, rest) {
-            decoded.push((high << 4) | low);
-            bytes = after;
-        } else {
-            decoded.push(*first);
-            bytes = rest;
-        }
-    }
-    decoded
-}
-
-fn hex_digit(digit: u8) -> Option<u8> {
-    let value = char::from(digit).to_digit(16)?;
-    u8::try_from(value).ok()
 }
 
 #[cfg(test)]
