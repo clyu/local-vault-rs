@@ -6,8 +6,9 @@ uses: the Android app (`clyu/bitwarden-android`) and the browser extension (the 
 
 The clients work without a Bitwarden server. What a server would have stored is kept in a vault
 folder, and the server is replaced by a local server that answers the same HTTP API from the
-files. The design is described in `docs/DECENTRALIZATION.md` of the Android app, and the format
-of the vault folder in `docs/LOCAL_VAULT_FORMAT.md` there, which is the contract between clients.
+files. The design is described in [docs/DESIGN.md](docs/DESIGN.md), and the format of the vault
+folder in [docs/LOCAL_VAULT_FORMAT.md](docs/LOCAL_VAULT_FORMAT.md), which is the contract between
+clients.
 
 Each client had its own implementation of the local server before, in Kotlin and in TypeScript,
 and they drifted apart in details that decide what ends up in `vault.json`. This one replaces
@@ -30,13 +31,25 @@ A client brings three things:
   right away, and the binding for Kotlin waits for the local server on the thread of the call.
 - **The platform**: the time, random bytes (the binding for Kotlin takes those of the operating
   system) and a log.
-- **The interception point**: where the requests of the client for a Bitwarden server are
-  handed to the local server, and its responses turned into HTTP responses.
+- **The interception point**: where the requests of the client for the host `vault.local.invalid`
+  are handed to the local server as they are (method, address, headers, body), and its responses,
+  which say their media type, turned into those of the HTTP client.
 
-The content of attachments does not pass through the local server, so that a client can write
-and read it as a stream. A response says where the body of the request has to be stored
-(`store_request_body_at`) or names the file whose content is its body (`ResponseBody::File`), and
-the client does that with its own file system.
+What a request asks for is worked out here, once for every client: the service it is for, the
+account of its token, its form and its query. The content of attachments is either streamed by
+the client, which leaves it out of the request and stores it where the response says
+(`handle_http`, as the Android app does), or handed over whole and stored by the local server
+under the lock of the request (`handle_http_buffered`, as the extension does).
+
+The rules that a client checks itself against are here as well, so that its tests do not hold a
+copy of them:
+
+| Rule | What a client checks with it |
+|------|------------------------------|
+| `is_answered` | Every request that its code can make: answered, or refused as needing a server. |
+| `FLAGS_THAT_MUST_BE_OFF` | Its feature flags that move requests out of reach of the local server: still there, and off by default. |
+| `check_file_system` | Its file system keeps the rules that the vault store counts on. |
+| `accounts_missing_in` | The accounts that it copies when the vault moves to another folder. |
 
 ## Where the earlier implementations differed
 
@@ -54,6 +67,8 @@ the client does that with its own file system.
 | The master password hint | `429`, the only status whose message the app shows | `400`, as the extension shows a message of its own for `429` | By client (`ClientKind`), the only thing that differs |
 | Claims of the access token | Without `client_id` | With `client_id` | With `client_id` |
 | A refused request in the log | IDs as `*` | Anything but words of the API as `{}` | Anything but words of the API as `*` |
+| What a request is | The path relative to the service, as OkHttp has it before the address of the server is filled in; a form by the type of the body | The address without `api`, `identity` or `events`; a form by `Content-Type`; segments that do not decode taken as they are | The address, without `api`, `identity` or `events`; a form by `Content-Type`; segments that do not decode taken as they are |
+| An account directory, to copy to another folder | `[A-Za-z0-9_-]{1,128}` in the app | Not copied | `is_safe_segment` |
 
 ## Building and testing
 
@@ -86,6 +101,10 @@ cargo run --release -p uniffi-bindgen -- generate --no-format \
 
 When the formatting check fails, the run has the change that `cargo fmt` makes as the artifact
 `rustfmt-patch`: `git apply rustfmt.patch` applies it.
+
+Each client builds the local vault itself, from the submodule that it has it in: the Android app
+in `network/build.gradle.kts`, and the extension with
+`apps/browser/src/local-vault/build-local-vault.sh`.
 
 ## License
 

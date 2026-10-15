@@ -3,8 +3,11 @@
 
 #![cfg(target_arch = "wasm32")]
 
-use js_sys::{JSON, Promise, Reflect};
-use local_vault_wasm::{JsFileSystem, JsPlatform, WasmLocalServer};
+use js_sys::{Array, JSON, Promise, Reflect, Uint8Array};
+use local_vault_wasm::{
+    JsFileSystem, JsPlatform, WasmLocalServer, check_file_system, flags_that_must_be_off,
+    is_answered,
+};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 use wasm_bindgen_test::wasm_bindgen_test;
@@ -96,14 +99,23 @@ export function testPlatform() {
 }
 
 export function request(method, path, body, accessToken, form) {
-  return {
-    method,
-    path: path.split("/"),
-    accessToken: accessToken ?? null,
-    form: form ?? {},
-    query: {},
-    body: body === undefined ? null : new TextEncoder().encode(JSON.stringify(body)),
-  };
+  const headers = {};
+  let content = null;
+  if (form != null) {
+    headers["Content-Type"] = "application/x-www-form-urlencoded;charset=UTF-8";
+    content = new TextEncoder().encode(new URLSearchParams(form).toString());
+  } else if (body != null) {
+    headers["Content-Type"] = "application/json";
+    content = new TextEncoder().encode(JSON.stringify(body));
+  }
+  if (accessToken != null) {
+    headers["Authorization"] = `Bearer ${accessToken}`;
+  }
+  return { method, url: `https://vault.local.invalid/${path}`, headers, body: content };
+}
+
+export function content(method, url, bytes) {
+  return { method, url, headers: {}, body: Uint8Array.from(bytes) };
 }
 "#)]
 extern "C" {
@@ -113,6 +125,7 @@ extern "C" {
     fn withForeignBody(request: JsValue) -> Promise;
     fn testPlatform() -> JsPlatform;
     fn request(method: &str, path: &str, body: JsValue, token: JsValue, form: JsValue) -> JsValue;
+    fn content(method: &str, url: &str, bytes: &[u8]) -> JsValue;
 }
 
 const REGISTRATION: &str = r#"{
@@ -125,6 +138,10 @@ const REGISTRATION: &str = r#"{
         "masterKeyWrappedUserKey": "2.userKey"
     }
 }"#;
+
+const REGISTER: &str = "identity/accounts/register/finish";
+
+const TOKEN: &str = "identity/connect/token";
 
 const LOGIN: &str = r#"{
     "grant_type": "password",
@@ -152,45 +169,106 @@ async fn handle(server: &WasmLocalServer, request: JsValue) -> Result<JsValue, J
     JsFuture::from(server.handle(request)).await
 }
 
+/// The JSON of the body of a response.
+fn text_of(response: &JsValue) -> JsValue {
+    parse(&field(response, "text").as_string().unwrap())
+}
+
+/// Registers an account, logs in to it, and returns its access token.
+async fn log_in(server: &WasmLocalServer) -> JsValue {
+    let none = JsValue::UNDEFINED;
+    let body = parse(REGISTRATION);
+    let registration = request("POST", REGISTER, body, none.clone(), none.clone());
+    handle(server, registration).await.unwrap();
+    let form = parse(LOGIN);
+    let login = request("POST", TOKEN, none.clone(), none, form);
+    let login = handle(server, login).await.unwrap();
+    field(&text_of(&login), "access_token")
+}
+
 #[wasm_bindgen_test]
 async fn an_account_is_registered_and_synced_on_the_file_system_of_the_extension() {
     let server = server(memoryFileSystem());
     let none = JsValue::UNDEFINED;
-    let path = "accounts/register/finish";
     let body = parse(REGISTRATION);
-    let registration = request("POST", path, body, none.clone(), none.clone());
+    let registration = request("POST", REGISTER, body, none.clone(), none.clone());
 
     let registered = handle(&server, registration).await.unwrap();
     let form = parse(LOGIN);
-    let login = request("POST", "connect/token", none.clone(), none.clone(), form);
+    let login = request("POST", TOKEN, none.clone(), none.clone(), form);
     let login = handle(&server, login).await.unwrap();
-    let login_body = parse(&field(&login, "json").as_string().unwrap());
-    let token = field(&login_body, "access_token");
-    let sync = request("GET", "sync", none.clone(), token, none.clone());
+    let token = field(&text_of(&login), "access_token");
+    let sync = request("GET", "api/sync", none.clone(), token, none.clone());
     let response = handle(&server, sync).await.unwrap();
 
     assert_eq!(field(&registered, "code").as_f64(), Some(200.0));
     assert_eq!(field(&login, "code").as_f64(), Some(200.0));
     assert_eq!(field(&response, "code").as_f64(), Some(200.0));
-    assert!(field(&response, "file").is_null());
-    assert!(field(&response, "storeRequestBodyAt").is_null());
-    let sync = parse(&field(&response, "json").as_string().unwrap());
-    let email = field(&field(&sync, "profile"), "email");
+    let content_type = field(&response, "contentType").as_string();
+    assert_eq!(
+        content_type.as_deref(),
+        Some("application/json; charset=utf-8")
+    );
+    assert!(field(&response, "bytes").is_null());
+    let email = field(&field(&text_of(&response), "profile"), "email");
     assert_eq!(email.as_string().as_deref(), Some("user@example.com"));
+}
+
+#[wasm_bindgen_test]
+async fn the_content_of_an_attachment_is_stored_and_read_by_the_local_server() {
+    let server = server(memoryFileSystem());
+    let none = JsValue::UNDEFINED;
+    let token = log_in(&server).await;
+    let item = parse(r#"{"type": 1}"#);
+    let cipher = request("POST", "api/ciphers", item, token.clone(), none.clone());
+    let cipher = text_of(&handle(&server, cipher).await.unwrap());
+    let cipher_id = field(&cipher, "id").as_string().unwrap();
+    let path = format!("api/ciphers/{cipher_id}/attachment/v2");
+    let upload = request("POST", &path, parse("{}"), token, none);
+    let upload = text_of(&handle(&server, upload).await.unwrap());
+    let url = field(&upload, "url").as_string().unwrap();
+
+    let put = content("PUT", &url, &[1, 2, 3]);
+    let stored = handle(&server, put).await.unwrap();
+    let get = content("GET", &url, &[]);
+    let read = handle(&server, get).await.unwrap();
+
+    assert_eq!(field(&stored, "code").as_f64(), Some(201.0));
+    assert_eq!(field(&read, "code").as_f64(), Some(200.0));
+    let content_type = field(&read, "contentType").as_string();
+    assert_eq!(content_type.as_deref(), Some("application/octet-stream"));
+    let bytes = Uint8Array::new(&field(&read, "bytes")).to_vec();
+    assert_eq!(bytes, [1, 2, 3]);
+}
+
+#[wasm_bindgen_test]
+async fn the_rules_that_the_extension_checks_itself_against_are_there() {
+    let scratch = vec!["check".to_owned()];
+    let checked = JsValue::from(check_file_system(memoryFileSystem(), scratch));
+    let failures = JsFuture::from(Promise::from(checked)).await.unwrap();
+    let Ok(flags) = flags_that_must_be_off("browser") else {
+        panic!("The client is not known.");
+    };
+    let key_of = |flag: JsValue| field(&flag, "key").as_string();
+    let keys: Vec<String> = Array::from(&flags).iter().filter_map(key_of).collect();
+
+    assert_eq!(Array::from(&failures).length(), 0);
+    assert!(keys.iter().any(|key| key == "pm-30110-sdk-sends-api"));
+    assert!(is_answered("GET", vec!["sync".to_owned()]));
+    assert!(!is_answered("GET", vec!["sends".to_owned()]));
 }
 
 #[wasm_bindgen_test]
 async fn bytes_from_another_realm_are_read() {
     let server = server(foreignFileSystem());
     let none = JsValue::UNDEFINED;
-    let path = "accounts/register/finish";
     let body = parse(REGISTRATION);
-    let registration = request("POST", path, body, none.clone(), none.clone());
+    let registration = request("POST", REGISTER, body, none.clone(), none.clone());
     let registration = JsFuture::from(withForeignBody(registration)).await.unwrap();
 
     let registered = handle(&server, registration).await.unwrap();
     let form = parse(LOGIN);
-    let login = request("POST", "connect/token", none.clone(), none, form);
+    let login = request("POST", TOKEN, none.clone(), none, form);
     let login = handle(&server, login).await.unwrap();
 
     // The body of the request is the account, and the vault folder has it when it is read.
@@ -203,7 +281,8 @@ async fn a_vault_folder_that_cannot_be_reached_rejects_with_an_io_error() {
     let server = server(unreachableFileSystem());
     let none = JsValue::UNDEFINED;
     let email = parse(r#"{"email": "user@example.com"}"#);
-    let pre_login = request("POST", "accounts/prelogin", email, none.clone(), none);
+    let path = "identity/accounts/prelogin";
+    let pre_login = request("POST", path, email, none.clone(), none);
 
     let error = handle(&server, pre_login).await.unwrap_err();
 

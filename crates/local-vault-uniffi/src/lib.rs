@@ -4,6 +4,10 @@
 //! client, and waits for the answer. The vault folder is reached through the [`VaultFileSystem`]
 //! that the app implements, which answers right away, so the server is driven to its end on the
 //! thread of the call.
+//!
+//! The app streams the content of attachments: it leaves the body of a request to an address
+//! that [`streams_request_body`] is `true` for out, stores it where the response says, and reads
+//! the file that the body of a response is.
 
 use std::collections::HashMap;
 use std::fmt::{self, Display, Formatter};
@@ -11,7 +15,7 @@ use std::sync::Arc;
 
 use futures::executor::block_on;
 use local_vault::{
-    ClientKind, FileSystem, IoError, LocalRequest, LocalResponse, LocalServer, LogLevel, Platform,
+    ClientKind, FileSystem, HttpRequest, HttpResponse, IoError, LocalServer, LogLevel, Platform,
     ResponseBody,
 };
 
@@ -105,20 +109,26 @@ pub enum VaultClientKind {
     Browser,
 }
 
-/// A request, as the app would have sent it to a Bitwarden server.
+impl From<VaultClientKind> for ClientKind {
+    fn from(client: VaultClientKind) -> Self {
+        match client {
+            VaultClientKind::Android => ClientKind::Android,
+            VaultClientKind::Browser => ClientKind::Browser,
+        }
+    }
+}
+
+/// A request, as the HTTP client of the app would have sent it to a Bitwarden server.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct VaultRequest {
-    /// The HTTP method, in upper case.
+    /// The HTTP method.
     pub method: String,
-    /// The decoded segments of the path, relative to the service: `sync`, not `api/sync`.
-    pub path: Vec<String>,
-    /// The bearer token of the request, if any.
-    pub access_token: Option<String>,
-    /// The fields of the body, if it is a form.
-    pub form: HashMap<String, String>,
-    /// The parameters of the query.
-    pub query: HashMap<String, String>,
-    /// The body, which is left out of a request for the content of an attachment.
+    /// The address, such as `https://vault.local.invalid/api/sync`.
+    pub url: String,
+    /// The headers, with their names in whatever case. `Content-Type` is one of them.
+    pub headers: HashMap<String, String>,
+    /// The body, which is left out of a request to an address that [`streams_request_body`] is
+    /// `true` for.
     pub body: Vec<u8>,
 }
 
@@ -144,6 +154,8 @@ pub enum VaultResponseBody {
 pub struct VaultResponse {
     /// The HTTP status code.
     pub code: u16,
+    /// The media type of the body, or `null` if there is no body.
+    pub content_type: Option<String>,
     /// The body.
     pub body: VaultResponseBody,
     /// Where the app has to store the body of the request, as it comes in, before it gives the
@@ -166,28 +178,32 @@ impl LocalVaultServer {
         platform: Box<dyn VaultPlatform>,
         client: VaultClientKind,
     ) -> Arc<Self> {
-        let client = match client {
-            VaultClientKind::Android => ClientKind::Android,
-            VaultClientKind::Browser => ClientKind::Browser,
-        };
-        let server = LocalServer::new(AppFileSystem(file_system), AppPlatform(platform), client);
+        let file_system = AppFileSystem(file_system);
+        let server = LocalServer::new(file_system, AppPlatform(platform), client.into());
         Arc::new(Self { server })
     }
 
     /// Answers a request. Requests are handled one at a time: a call waits for the one before
     /// it. Fails only if the vault folder cannot be reached.
     pub fn handle(&self, request: VaultRequest) -> Result<VaultResponse, LocalVaultError> {
-        let request = LocalRequest {
+        let request = HttpRequest {
             method: request.method,
-            path: request.path,
-            access_token: request.access_token,
-            form: request.form,
-            query: request.query,
+            url: request.url,
+            headers: request.headers.into_iter().collect(),
             body: request.body,
         };
-        let response = block_on(self.server.handle(&request))?;
+        let response = block_on(self.server.handle_http(request))?;
         Ok(to_vault_response(response))
     }
+}
+
+/// A feature flag that the local vault counts on to be off.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct VaultFlagRule {
+    /// The name of the flag.
+    pub key: String,
+    /// What the app does when the flag is on.
+    pub reason: String,
 }
 
 /// Returns `true` if the name can be used as the name of a file or a directory in the vault
@@ -203,21 +219,84 @@ pub fn local_vault_host() -> String {
     local_vault::LOCAL_VAULT_HOST.to_owned()
 }
 
-/// The first segment of the path of a request for the content of an attachment, whose body is
-/// not read by the local server but stored by the app.
+/// Returns `true` if the address is one of the local vault, which no request may leave the
+/// device for.
 #[uniffi::export]
-pub fn attachments_path() -> String {
-    local_vault::ATTACHMENTS_PATH.to_owned()
+pub fn is_local_vault_url(url: String) -> bool {
+    local_vault::is_local_vault_url(&url)
 }
 
-fn to_vault_response(response: LocalResponse) -> VaultResponse {
+/// Returns `true` if the local server does not read the body of a request to the address: it is
+/// the content of an attachment, which the app stores where the response says.
+#[uniffi::export]
+pub fn streams_request_body(url: String) -> bool {
+    local_vault::streams_request_body(&url)
+}
+
+/// The body of the response that the app gives when a call of the local server fails in a way
+/// that the local server does not answer.
+#[uniffi::export]
+pub fn internal_error_json() -> String {
+    local_vault::INTERNAL_ERROR_JSON.to_owned()
+}
+
+/// Returns `true` if the local server answers the request, and does not refuse it as a feature
+/// that needs a Bitwarden server. The path is relative to the service, with a UUID wherever the
+/// ID of an item or a folder goes.
+#[uniffi::export]
+pub fn is_answered(method: String, path: Vec<String>) -> bool {
+    let path: Vec<&str> = path.iter().map(String::as_str).collect();
+    local_vault::is_answered(&method, &path)
+}
+
+/// The feature flags of the client that the local vault counts on to be off.
+#[uniffi::export]
+pub fn flags_that_must_be_off(client: VaultClientKind) -> Vec<VaultFlagRule> {
+    let client = ClientKind::from(client);
+    let rules = local_vault::FLAGS_THAT_MUST_BE_OFF.iter();
+    let rules = rules.filter(|rule| rule.clients.contains(&client));
+    let rules = rules.map(|rule| VaultFlagRule {
+        key: rule.key.to_owned(),
+        reason: rule.reason.to_owned(),
+    });
+    rules.collect()
+}
+
+/// The accounts that the vault folder of the source has and that of the target does not, which
+/// the app copies when the vault moves to the target.
+#[uniffi::export]
+pub fn accounts_missing_in(
+    source: Box<dyn VaultFileSystem>,
+    target: Box<dyn VaultFileSystem>,
+) -> Result<Vec<String>, LocalVaultError> {
+    let source = AppFileSystem(source);
+    let target = AppFileSystem(target);
+    let missing = block_on(local_vault::accounts_missing_in(&source, &target))?;
+    Ok(missing)
+}
+
+/// Checks that the file system keeps the rules that the local vault counts on, in the directory
+/// at the path `scratch`, which is deleted with everything in it before and after. Returns the
+/// rules that it does not keep.
+#[uniffi::export]
+pub fn check_file_system(
+    file_system: Box<dyn VaultFileSystem>,
+    scratch: Vec<String>,
+) -> Vec<String> {
+    let file_system = AppFileSystem(file_system);
+    let scratch: Vec<&str> = scratch.iter().map(String::as_str).collect();
+    block_on(local_vault::check_file_system(&file_system, &scratch))
+}
+
+fn to_vault_response(response: HttpResponse) -> VaultResponse {
     let body = match response.body {
         ResponseBody::Empty => VaultResponseBody::Empty,
         ResponseBody::Json(json) => VaultResponseBody::Json { json },
         ResponseBody::File(path) => VaultResponseBody::File { path },
     };
     VaultResponse {
-        code: response.code,
+        code: response.status,
+        content_type: response.content_type.map(str::to_owned),
         body,
         store_request_body_at: response.store_request_body_at,
     }
@@ -353,13 +432,13 @@ mod tests {
         }
     }
 
-    fn request(method: &str, path: &[&str], body: &str) -> VaultRequest {
+    fn request(method: &str, path: &str, body: &str) -> VaultRequest {
+        let mut headers = HashMap::new();
+        headers.insert("Content-Type".to_owned(), "application/json".to_owned());
         VaultRequest {
             method: method.to_owned(),
-            path: owned(path),
-            access_token: None,
-            form: HashMap::new(),
-            query: HashMap::new(),
+            url: format!("https://vault.local.invalid{path}"),
+            headers,
             body: body.as_bytes().to_vec(),
         }
     }
@@ -381,14 +460,32 @@ mod tests {
             }
         }"#;
 
-        let register = ["accounts", "register", "finish"];
-        let registered = server.handle(request("POST", &register, registration));
+        let register = "/identity/accounts/register/finish";
+        let registered = server.handle(request("POST", register, registration));
         let hint = r#"{"email": "user@example.com"}"#;
-        let hint = request("POST", &["accounts", "password-hint"], hint);
-        let hint = server.handle(hint);
+        let hint = server.handle(request("POST", "/api/accounts/password-hint", hint));
 
-        assert_eq!(registered.ok().map(|response| response.code), Some(200));
+        let Ok(registered) = registered else {
+            panic!("The account is not registered.");
+        };
+        let json = Some("application/json; charset=utf-8".to_owned());
+        assert_eq!(registered.code, 200);
+        assert_eq!(registered.content_type, json);
         assert_eq!(hint.ok().map(|response| response.code), Some(429));
         assert_eq!(fs.paths().len(), 1);
+    }
+
+    #[test]
+    fn the_rules_that_the_app_checks_itself_against_are_there() {
+        let fs = Box::new(MemoryCallback(MemoryFileSystem::new()));
+        let scratch = vec!["check".to_owned()];
+        let flags = flags_that_must_be_off(VaultClientKind::Android);
+        let keys: Vec<&str> = flags.iter().map(|flag| flag.key.as_str()).collect();
+
+        assert!(check_file_system(fs, scratch).is_empty());
+        assert!(keys.contains(&"pm-27060-password-prelogin-from-sdk"));
+        assert!(!keys.contains(&"pm-30110-sdk-sends-api"));
+        assert!(is_answered("GET".to_owned(), vec!["sync".to_owned()]));
+        assert!(!is_answered("GET".to_owned(), vec!["sends".to_owned()]));
     }
 }

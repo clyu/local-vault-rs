@@ -3,15 +3,14 @@
 //! The browser extension creates a [`WasmLocalServer`] on the file system that reaches its vault
 //! folder, and hands it every request for the host of the local vault. The file system answers
 //! with promises, as it reaches the folder through messages to another program.
+//!
+//! The extension has the content of an attachment in memory, so the local server stores it and
+//! reads it itself, while no other request is handled.
 
-use std::collections::HashMap;
 use std::rc::Rc;
 
 use js_sys::{Array, Error, Object, Promise, Reflect, Uint8Array};
-use local_vault::{
-    ClientKind, FileSystem, IoError, LocalRequest, LocalResponse, LocalServer, LogLevel, Platform,
-    ResponseBody,
-};
+use local_vault::{ClientKind, FileSystem, HttpRequest, IoError, LocalServer, LogLevel, Platform};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{JsFuture, future_to_promise};
 
@@ -46,26 +45,32 @@ export interface LocalVaultPlatform {
   log(level: "warning" | "error", message: string): void;
 }
 
-/** A request, as the extension would have sent it to a Bitwarden server. */
+/**
+ * A request, as the extension would have sent it to a Bitwarden server: its address, such as
+ * `https://vault.local.invalid/api/sync`, and its headers, with their names in whatever case.
+ */
 export interface LocalVaultRequest {
   method: string;
-  path: string[];
-  accessToken: string | null;
-  form: Record<string, string>;
-  query: Record<string, string>;
+  url: string;
+  headers: Record<string, string>;
   body: Uint8Array | null;
 }
 
 /**
- * A response. `json` is the body for `application/json`, `file` the path of the file whose
- * content is the body for `application/octet-stream`, and `storeRequestBodyAt` the path of the
- * file that the body of the request has to be written to before the response is given.
+ * A response. `contentType` is the media type of the body, `text` the body if it is JSON, and
+ * `bytes` the body if it is the encrypted content of an attachment.
  */
 export interface LocalVaultResponse {
   code: number;
-  json: string | null;
-  file: string[] | null;
-  storeRequestBodyAt: string[] | null;
+  contentType: string | null;
+  text: string | null;
+  bytes: Uint8Array | null;
+}
+
+/** A feature flag that the local vault counts on to be off, and what the app does if it is on. */
+export interface LocalVaultFlagRule {
+  key: string;
+  reason: string;
 }
 "#;
 
@@ -105,6 +110,14 @@ extern "C" {
 
     #[wasm_bindgen(method)]
     fn log(this: &JsPlatform, level: &str, message: &str);
+
+    /// The feature flags that the local vault counts on to be off.
+    #[wasm_bindgen(typescript_type = "LocalVaultFlagRule[]")]
+    pub type FlagRules;
+
+    /// What the checks of a file system come to: the rules that it does not keep.
+    #[wasm_bindgen(typescript_type = "Promise<string[]>")]
+    pub type BrokenRules;
 }
 
 /// The local server, which answers the requests of the extension in place of a Bitwarden server.
@@ -123,11 +136,7 @@ impl WasmLocalServer {
         platform: JsPlatform,
         #[wasm_bindgen(unchecked_param_type = "\"browser\" | \"android\"")] client: &str,
     ) -> Result<WasmLocalServer, JsError> {
-        let client = match client {
-            "android" => ClientKind::Android,
-            "browser" => ClientKind::Browser,
-            _ => return Err(JsError::new("The client is \"browser\" or \"android\".")),
-        };
+        let client = client_kind(client)?;
         let file_system = HostFileSystem(file_system);
         let server = LocalServer::new(file_system, HostPlatform(platform), client);
         Ok(Self {
@@ -136,8 +145,9 @@ impl WasmLocalServer {
     }
 
     /// Answers a `LocalVaultRequest` with a `LocalVaultResponse`. Requests are handled one at a
-    /// time: one that comes while another one is handled waits for it. Rejects with an error
-    /// named `LocalVaultIoError` if the vault folder cannot be reached, and with nothing else.
+    /// time, the content of an attachment included: one that comes while another one is handled
+    /// waits for it. Rejects with an error named `LocalVaultIoError` if the vault folder cannot
+    /// be reached, and with nothing else for a request that is one.
     #[wasm_bindgen(unchecked_return_type = "Promise<LocalVaultResponse>")]
     pub fn handle(
         &self,
@@ -146,7 +156,7 @@ impl WasmLocalServer {
         let server = Rc::clone(&self.server);
         future_to_promise(async move {
             let request = to_request(&request)?;
-            match server.handle(&request).await {
+            match server.handle_http_buffered(request).await {
                 Ok(response) => Ok(to_js_response(&response)),
                 Err(error) => Err(to_js_error(&error)),
             }
@@ -167,29 +177,81 @@ pub fn local_vault_host() -> String {
     local_vault::LOCAL_VAULT_HOST.to_owned()
 }
 
-/// The first segment of the path of a request for the content of an attachment, whose body is
-/// not read by the local server but stored by the extension.
-#[wasm_bindgen(js_name = attachmentsPath)]
-pub fn attachments_path() -> String {
-    local_vault::ATTACHMENTS_PATH.to_owned()
+/// Returns `true` if the address is one of the local vault, which no request may leave the
+/// browser for.
+#[wasm_bindgen(js_name = isLocalVaultUrl)]
+pub fn is_local_vault_url(url: &str) -> bool {
+    local_vault::is_local_vault_url(url)
 }
 
-fn to_request(value: &JsValue) -> Result<LocalRequest, JsValue> {
+/// The body of the response that the extension gives when a call of the local server fails in a
+/// way that the local server does not answer, which may leave it unusable: the extension takes
+/// it before.
+#[wasm_bindgen(js_name = internalErrorJson)]
+pub fn internal_error_json() -> String {
+    local_vault::INTERNAL_ERROR_JSON.to_owned()
+}
+
+/// Returns `true` if the local server answers the request, and does not refuse it as a feature
+/// that needs a Bitwarden server. The path is relative to the service, with a UUID wherever the
+/// ID of an item or a folder goes.
+#[wasm_bindgen(js_name = isAnswered)]
+pub fn is_answered(method: &str, path: Vec<String>) -> bool {
+    let path: Vec<&str> = path.iter().map(String::as_str).collect();
+    local_vault::is_answered(method, &path)
+}
+
+/// The feature flags of the client, which is `"browser"` or `"android"`, that the local vault
+/// counts on to be off.
+#[wasm_bindgen(js_name = flagsThatMustBeOff)]
+pub fn flags_that_must_be_off(
+    #[wasm_bindgen(unchecked_param_type = "\"browser\" | \"android\"")] client: &str,
+) -> Result<FlagRules, JsError> {
+    let client = client_kind(client)?;
+    let rules = local_vault::FLAGS_THAT_MUST_BE_OFF.iter();
+    let rules = rules.filter(|rule| rule.clients.contains(&client));
+    let rules = rules.map(|rule| {
+        let fields = [("key", rule.key), ("reason", rule.reason)];
+        JsValue::from(to_object(fields.map(|(key, value)| (key, value.into()))))
+    });
+    Ok(rules.collect::<Array>().unchecked_into())
+}
+
+/// Checks that the file system keeps the rules that the local vault counts on, in the directory
+/// at the path `scratch`, which is deleted with everything in it before and after. Resolves to
+/// the rules that it does not keep.
+#[wasm_bindgen(js_name = checkFileSystem)]
+pub fn check_file_system(file_system: JsFileSystem, scratch: Vec<String>) -> BrokenRules {
+    let checked = future_to_promise(async move {
+        let file_system = HostFileSystem(file_system);
+        let scratch: Vec<&str> = scratch.iter().map(String::as_str).collect();
+        let failures = local_vault::check_file_system(&file_system, &scratch).await;
+        Ok(to_array(&failures).into())
+    });
+    checked.unchecked_into()
+}
+
+fn client_kind(client: &str) -> Result<ClientKind, JsError> {
+    match client {
+        "android" => Ok(ClientKind::Android),
+        "browser" => Ok(ClientKind::Browser),
+        _ => Err(JsError::new("The client is \"browser\" or \"android\".")),
+    }
+}
+
+fn to_request(value: &JsValue) -> Result<HttpRequest, JsValue> {
     let field = |key: &str| Reflect::get(value, &JsValue::from_str(key));
     let method = field("method")?
         .as_string()
         .ok_or_else(|| JsError::new("A request needs a method."))?;
-    let path = Array::from(&field("path")?)
-        .iter()
-        .filter_map(|segment| segment.as_string())
-        .collect();
+    let url = field("url")?
+        .as_string()
+        .ok_or_else(|| JsError::new("A request needs an address."))?;
     let body = bytes(&field("body")?).unwrap_or_default();
-    Ok(LocalRequest {
+    Ok(HttpRequest {
         method,
-        path,
-        access_token: field("accessToken")?.as_string(),
-        form: to_map(&field("form")?),
-        query: to_map(&field("query")?),
+        url,
+        headers: to_pairs(&field("headers")?),
         body,
     })
 }
@@ -203,42 +265,44 @@ fn bytes(value: &JsValue) -> Option<Vec<u8>> {
     value.is_object().then(|| Uint8Array::new(value).to_vec())
 }
 
-fn to_map(value: &JsValue) -> HashMap<String, String> {
+/// The names and the values of an object of strings, such as the headers of a request.
+fn to_pairs(value: &JsValue) -> Vec<(String, String)> {
     if !value.is_object() {
-        return HashMap::new();
+        return Vec::new();
     }
-    let mut map = HashMap::new();
+    let mut pairs = Vec::new();
     for entry in Object::entries(value.unchecked_ref()).iter() {
         let entry = Array::from(&entry);
         if let (Some(key), Some(value)) = (entry.get(0).as_string(), entry.get(1).as_string()) {
-            map.insert(key, value);
+            pairs.push((key, value));
         }
     }
-    map
+    pairs
 }
 
-fn to_js_response(response: &LocalResponse) -> JsValue {
-    let (json, file) = match &response.body {
-        ResponseBody::Empty => (JsValue::NULL, JsValue::NULL),
-        ResponseBody::Json(json) => (JsValue::from_str(json), JsValue::NULL),
-        ResponseBody::File(path) => (JsValue::NULL, to_array(path).into()),
-    };
-    let store_at = match &response.store_request_body_at {
-        Some(path) => to_array(path).into(),
+fn to_js_response(response: &local_vault::BufferedResponse) -> JsValue {
+    let or_null = |value: Option<&str>| value.map_or(JsValue::NULL, JsValue::from_str);
+    let bytes = match &response.bytes {
+        Some(bytes) => Uint8Array::from(bytes.as_slice()).into(),
         None => JsValue::NULL,
     };
-    let object = Object::new();
     let fields = [
-        ("code", JsValue::from(response.code)),
-        ("json", json),
-        ("file", file),
-        ("storeRequestBodyAt", store_at),
+        ("code", JsValue::from(response.status)),
+        ("contentType", or_null(response.content_type)),
+        ("text", or_null(response.text.as_deref())),
+        ("bytes", bytes),
     ];
+    to_object(fields).into()
+}
+
+/// A new object with the fields.
+fn to_object<const N: usize>(fields: [(&str, JsValue); N]) -> Object {
+    let object = Object::new();
     for (key, value) in fields {
         // Setting a field of a new object cannot fail.
         let _ = Reflect::set(&object, &JsValue::from_str(key), &value);
     }
-    object.into()
+    object
 }
 
 fn to_js_error(error: &IoError) -> JsValue {

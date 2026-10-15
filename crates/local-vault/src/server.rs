@@ -7,17 +7,19 @@ use crate::account::{profile, verify_password};
 use crate::date::format_date;
 use crate::fs::{FileSystem, IoError};
 use crate::http::{
-    InvalidRequest, LocalRequest, LocalResponse, invalid_request_response, is_uuid, list_response,
-    ok_empty_response, ok_response, unauthorized_response, unsupported_response,
+    InvalidRequest, LocalRequest, LocalResponse, ResponseBody, invalid_request_response, is_uuid,
+    list_response, ok_empty_response, ok_response, unauthorized_response, unsupported_response,
 };
 use crate::json::{JsonObject, with_fields};
 use crate::platform::{LogLevel, Platform, new_uuid};
-use crate::store::{KEY_REVISION_DATE, LocalVaultStore};
+use crate::store::{KEY_REVISION_DATE, LocalVaultStore, as_strs};
 use crate::token::user_id_of_access_token;
 use crate::vault::{ATTACHMENTS_PATH, get_attachment, get_cipher, get_folder, renew_attachment};
 
 /// The version of the Bitwarden server that the local server says it is.
 const SERVER_VERSION: &str = "2026.9.0";
+
+const ATTACHMENT_GONE_MESSAGE: &str = "The content of the attachment is gone.";
 
 /// The client that the local server answers, for the one thing that it does differently for
 /// each: what tells the client the master password hint.
@@ -28,6 +30,63 @@ pub enum ClientKind {
     /// The browser extension, which shows its own message for `429 Too Many Requests`.
     Browser,
 }
+
+/// A feature flag that the local vault counts on to be off. The local server reports no flags,
+/// so a client gives each flag the value that it has by default, and a flag of these moves
+/// requests to where the local server does not follow them when it is on: into the Bitwarden
+/// SDK, which makes them by itself and which the Android app does not hand to the local server,
+/// or to routes that the local server refuses.
+///
+/// Every client checks that the flags that it has are off by default, and that they are still
+/// there: a flag that upstream removes is a code path that is then always taken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlagRule {
+    /// The name of the flag, which is the same in every client that has it.
+    pub key: &'static str,
+    /// The clients that have the flag.
+    pub clients: &'static [ClientKind],
+    /// What a client does when the flag is on.
+    pub reason: &'static str,
+}
+
+/// The feature flags that the local vault counts on to be off.
+pub const FLAGS_THAT_MUST_BE_OFF: &[FlagRule] = &[
+    FlagRule {
+        key: "pm-27632-cipher-crud-operations-to-sdk",
+        clients: &[ClientKind::Browser],
+        reason: "the SDK saves, changes and deletes items",
+    },
+    FlagRule {
+        key: "pm-28192-cipher-attachment-ops-to-sdk",
+        clients: &[ClientKind::Browser],
+        reason: "the SDK makes the requests for attachments",
+    },
+    FlagRule {
+        key: "pm-27060-password-prelogin-from-sdk",
+        clients: &[ClientKind::Android, ClientKind::Browser],
+        reason: "the SDK asks how a master key is derived",
+    },
+    FlagRule {
+        key: "pm-30110-sdk-sends-api",
+        clients: &[ClientKind::Browser],
+        reason: "the SDK makes the requests for Sends",
+    },
+    FlagRule {
+        key: "pm-27278-v2-password-registration",
+        clients: &[ClientKind::Android, ClientKind::Browser],
+        reason: "the SDK registers accounts, with other keys",
+    },
+    FlagRule {
+        key: "force-upgrade-v2-encryption",
+        clients: &[ClientKind::Browser],
+        reason: "the keys of an account are replaced by other ones",
+    },
+    FlagRule {
+        key: "pm-12241-private-key-regeneration",
+        clients: &[ClientKind::Browser],
+        reason: "the key pair of an account is made again",
+    },
+];
 
 /// Does what the Bitwarden server does for a single user, on top of a vault folder: it registers
 /// and authenticates accounts, and stores their encrypted items, folders and attachments.
@@ -71,6 +130,20 @@ impl From<InvalidRequest> for Failure {
 
 /// What a handler of a request comes to.
 pub(crate) type Outcome = Result<LocalResponse, Failure>;
+
+/// What answers a request that is made without an account.
+enum PublicRoute {
+    Token,
+    PreLogin,
+    SendVerificationEmail,
+    VerificationEmailClicked,
+    RegisterFinish,
+    PasswordHint,
+    Config,
+    KnownDevice,
+    Collect,
+    AttachmentContent,
+}
 
 /// What answers a request that is made as an account, once the account is known. It borrows the
 /// IDs from the path of the request.
@@ -143,7 +216,42 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
     /// Bitwarden API reports errors in.
     pub async fn handle(&self, request: &LocalRequest) -> Result<LocalResponse, IoError> {
         let mut state = self.state.lock().await;
-        match self.route(request, &mut state).await {
+        self.handle_locked(request, &mut state).await
+    }
+
+    /// Answers a request, and does what the response says with the content of an attachment
+    /// before the next request is handled: stores the body of the request where the response
+    /// says, and reads the file whose content is the body of the response, which it returns
+    /// along with the response.
+    ///
+    /// It is for a client that has the content of an attachment in memory anyway. Fails if the
+    /// vault folder cannot be reached, which a file of a response that is gone is taken for.
+    pub(crate) async fn handle_with_content(
+        &self,
+        request: &LocalRequest,
+    ) -> Result<(LocalResponse, Option<Vec<u8>>), IoError> {
+        let mut state = self.state.lock().await;
+        let response = self.handle_locked(request, &mut state).await?;
+        let fs = self.file_system();
+        if let Some(path) = &response.store_request_body_at {
+            fs.write(&as_strs(path), &request.body).await?;
+        }
+        let content = match &response.body {
+            ResponseBody::File(path) => {
+                let gone = || IoError::new(ATTACHMENT_GONE_MESSAGE);
+                Some(fs.read(&as_strs(path)).await?.ok_or_else(gone)?)
+            }
+            _ => None,
+        };
+        Ok((response, content))
+    }
+
+    async fn handle_locked(
+        &self,
+        request: &LocalRequest,
+        state: &mut State,
+    ) -> Result<LocalResponse, IoError> {
+        match self.route(request, state).await {
             Ok(response) => Ok(response),
             Err(Failure::InvalidRequest) => Ok(invalid_request_response()),
             Err(Failure::Io(error)) => Err(error),
@@ -151,25 +259,22 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
     }
 
     async fn route(&self, request: &LocalRequest, state: &mut State) -> Outcome {
+        use PublicRoute as R;
         let path: Vec<&str> = request.path.iter().map(String::as_str).collect();
-        match (request.method.as_str(), path.as_slice()) {
-            ("POST", ["connect", "token"]) => self.token(request).await,
-            ("POST", ["accounts", "prelogin"] | ["accounts", "prelogin", "password"]) => {
-                self.pre_login(request).await
-            }
-            ("POST", ["accounts", "register", "send-verification-email"]) => {
-                self.send_verification_email(request).await
-            }
-            ("POST", ["accounts", "register", "verification-email-clicked"]) => {
-                Ok(ok_empty_response())
-            }
-            ("POST", ["accounts", "register", "finish"]) => self.register_finish(request).await,
-            ("POST", ["accounts", "password-hint"]) => self.password_hint(request).await,
-            ("GET", ["config"]) => Ok(ok_response(&config())),
-            ("GET", ["devices", "knowndevice"]) => Ok(ok_response(&Value::Bool(false))),
-            ("POST", ["collect"]) => Ok(ok_empty_response()),
-            (_, [ATTACHMENTS_PATH, ..]) => self.attachment_content(request).await,
-            _ => self.route_authenticated(request, &path, state).await,
+        let Some(route) = public_route(&request.method, &path) else {
+            return self.route_authenticated(request, &path, state).await;
+        };
+        match route {
+            R::Token => self.token(request).await,
+            R::PreLogin => self.pre_login(request).await,
+            R::SendVerificationEmail => self.send_verification_email(request).await,
+            R::VerificationEmailClicked => Ok(ok_empty_response()),
+            R::RegisterFinish => self.register_finish(request).await,
+            R::PasswordHint => self.password_hint(request).await,
+            R::Config => Ok(ok_response(&config())),
+            R::KnownDevice => Ok(ok_response(&Value::Bool(false))),
+            R::Collect => Ok(ok_empty_response()),
+            R::AttachmentContent => self.attachment_content(request).await,
         }
     }
 
@@ -292,6 +397,40 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
             None => Ok(None),
         }
     }
+}
+
+/// Returns `true` if the local server answers the request, and does not refuse it as a feature
+/// that needs a Bitwarden server. The path is relative to the service that the request is for,
+/// and has a UUID wherever the ID of an item or a folder goes. Whether the request succeeds
+/// depends on what it asks for and on whose request it is.
+///
+/// It is what a client checks the requests that it can make against, so that the route table
+/// is only here.
+pub fn is_answered(method: &str, path: &[&str]) -> bool {
+    public_route(method, path).is_some() || account_route(method, path).is_some()
+}
+
+/// Returns what answers a request that is made without an account, or `None` if it is not one
+/// of those. The content of an attachment is reached by its address alone, as that of cloud
+/// storage is.
+fn public_route(method: &str, path: &[&str]) -> Option<PublicRoute> {
+    use PublicRoute as R;
+    let route = match (method, path) {
+        ("POST", ["connect", "token"]) => R::Token,
+        ("POST", ["accounts", "prelogin"] | ["accounts", "prelogin", "password"]) => R::PreLogin,
+        ("POST", ["accounts", "register", "send-verification-email"]) => R::SendVerificationEmail,
+        ("POST", ["accounts", "register", "verification-email-clicked"]) => {
+            R::VerificationEmailClicked
+        }
+        ("POST", ["accounts", "register", "finish"]) => R::RegisterFinish,
+        ("POST", ["accounts", "password-hint"]) => R::PasswordHint,
+        ("GET", ["config"]) => R::Config,
+        ("GET", ["devices", "knowndevice"]) => R::KnownDevice,
+        ("POST", ["collect"]) => R::Collect,
+        ("GET" | "PUT", [ATTACHMENTS_PATH, ..]) => R::AttachmentContent,
+        _ => return None,
+    };
+    Some(route)
 }
 
 /// Returns what answers a request that is made as an account, or `None` if there is no route

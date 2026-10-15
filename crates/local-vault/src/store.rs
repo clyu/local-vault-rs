@@ -219,7 +219,35 @@ impl<F: FileSystem> LocalVaultStore<F> {
     }
 }
 
-fn as_strs(path: &[String]) -> Vec<&str> {
+/// Returns the accounts that the vault folder of the source has and that of the target does
+/// not, sorted: what a client copies when the vault moves to another folder. An account that
+/// the target has is never one of them, so copying them never replaces an account that another
+/// device put there.
+///
+/// An account is any entry whose name the local vault could have given it. The client copies
+/// each of them with everything in it, as it can do it as a stream.
+pub async fn accounts_missing_in<S: FileSystem, T: FileSystem>(
+    source: &S,
+    target: &T,
+) -> Result<Vec<String>, IoError> {
+    let mut account_ids: Vec<String> = source
+        .list(&[])
+        .await?
+        .into_iter()
+        .filter(|name| is_safe_segment(name))
+        .collect();
+    account_ids.sort();
+    let mut missing = Vec::new();
+    for account_id in account_ids {
+        if !target.exists(&[account_id.as_str()]).await? {
+            missing.push(account_id);
+        }
+    }
+    Ok(missing)
+}
+
+/// The path as the file system takes it.
+pub(crate) fn as_strs(path: &[String]) -> Vec<&str> {
     path.iter().map(String::as_str).collect()
 }
 
@@ -438,5 +466,22 @@ mod tests {
             assert!(block_on(store.delete_all_attachments(name)).unwrap());
             assert!(fs.paths().is_empty());
         }
+    }
+
+    #[test]
+    fn the_accounts_that_a_folder_does_not_have_are_found_to_be_copied() {
+        let source = MemoryFileSystem::new();
+        let target = MemoryFileSystem::new();
+        for id in ["account-b", "account-a", "account-c"] {
+            source.put(&[id, VAULT_FILE], bytes(id));
+        }
+        source.put(&["notes.txt"], bytes("not an account"));
+        source.put(&["not safe", VAULT_FILE], bytes("hidden"));
+        target.put(&["account-c", VAULT_FILE], bytes("another device"));
+
+        let missing = block_on(accounts_missing_in(&source, &target)).unwrap();
+
+        assert_eq!(missing, ["account-a", "account-b"]);
+        assert_eq!(target.paths().len(), 1);
     }
 }

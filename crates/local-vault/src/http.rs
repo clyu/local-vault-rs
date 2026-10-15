@@ -12,6 +12,13 @@ pub(crate) const HTTP_NOT_FOUND: u16 = 404;
 pub(crate) const HTTP_TOO_MANY_REQUESTS: u16 = 429;
 pub(crate) const HTTP_INTERNAL_ERROR: u16 = 500;
 
+/// The body of the response that a client gives when its call of the local server fails in a
+/// way that the local server does not answer, in the shape that the Bitwarden API reports errors
+/// in. A client has it ready before it calls the local server, as a call that fails that way may
+/// leave the local server unusable.
+pub const INTERNAL_ERROR_JSON: &str =
+    r#"{"message":"An unexpected error occurred.","validationErrors":null,"object":"error"}"#;
+
 const UNSUPPORTED_MESSAGE: &str =
     "This feature needs a Bitwarden server and is not available with a local vault.";
 const INVALID_REQUEST_MESSAGE: &str = "The request is not valid.";

@@ -9,7 +9,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use common::*;
 use futures::executor::block_on;
 use futures::future::join_all;
-use local_vault::{ClientKind, FileSystem, IoError, MemoryFileSystem};
+use local_vault::{
+    ClientKind, FLAGS_THAT_MUST_BE_OFF, FileSystem, IoError, MemoryFileSystem, is_answered,
+};
 use serde_json::json;
 
 fn browser() -> (Client<MemoryFileSystem>, MemoryFileSystem) {
@@ -85,6 +87,49 @@ fn features_that_need_a_server_are_reported_as_not_available() {
         assert_eq!(response.code, 400, "{method} {path}");
         assert_eq!(body(&response), unsupported, "{method} {path}");
     }
+}
+
+#[test]
+fn what_is_answered_is_known_without_making_the_request() {
+    let (client, _) = browser();
+    let (token, _) = client.register_and_log_in();
+    let item = format!("ciphers/{UNKNOWN_ID}");
+    let archive = format!("ciphers/{UNKNOWN_ID}/archive");
+    let share = format!("ciphers/{UNKNOWN_ID}/share");
+    let requests = [
+        ("GET", "sync"),
+        ("POST", "connect/token"),
+        ("GET", item.as_str()),
+        ("PUT", archive.as_str()),
+        ("PUT", "devices/identifier/id/token"),
+        ("PUT", "attachments/a/b/c"),
+        ("GET", "sends"),
+        ("PUT", share.as_str()),
+        ("PUT", "ciphers/mockId/archive"),
+        ("DELETE", "ciphers/admin"),
+        ("DELETE", "attachments/a/b/c"),
+        ("GET", "accounts/webauthn/assertion-options"),
+    ];
+
+    for (method, path) in requests {
+        let parts: Vec<&str> = path.split('/').collect();
+        let response = client.call(method, path, &token);
+        let refused = message(&response) == UNSUPPORTED_MESSAGE;
+
+        assert_eq!(is_answered(method, &parts), !refused, "{method} {path}");
+    }
+}
+
+#[test]
+fn every_feature_flag_that_has_to_be_off_is_listed_once_for_its_clients() {
+    let rules = FLAGS_THAT_MUST_BE_OFF;
+    let keys: Vec<&str> = rules.iter().map(|rule| rule.key).collect();
+    let mut unique = keys.clone();
+    unique.sort_unstable();
+    unique.dedup();
+
+    assert_eq!(unique.len(), keys.len());
+    assert!(rules.iter().all(|rule| !rule.clients.is_empty()));
 }
 
 #[test]
