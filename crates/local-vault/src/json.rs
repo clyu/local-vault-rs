@@ -43,11 +43,25 @@ const BASE64_URL: GeneralPurpose = GeneralPurpose::new(
 /// folder without leaving the directory that it is placed in: it is made of 1 to 128 ASCII
 /// letters, digits, `-` and `_`.
 pub fn is_safe_segment(name: &str) -> bool {
+    is_name_of(name, b"-_")
+}
+
+/// Returns `true` if the name of an entry that a directory of the vault folder lists can be
+/// handed back to the file system: it is made of 1 to 128 ASCII letters, digits, `.`, `-` and
+/// `_`, and is not `.` or `..`. Those are the names of the files of a vault, and those that a
+/// tool that syncs the folder gives its copies of them, such as
+/// `vault.sync-conflict-20261016-143107-ABCDEFG.json`.
+pub(crate) fn is_entry_name(name: &str) -> bool {
+    name != "." && name != ".." && is_name_of(name, b".-_")
+}
+
+/// Returns `true` if the name is made of 1 to 128 ASCII letters, digits and the punctuation.
+fn is_name_of(name: &str, punctuation: &[u8]) -> bool {
     !name.is_empty()
         && name.len() <= MAX_SEGMENT_LENGTH
         && name
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            .all(|b| b.is_ascii_alphanumeric() || punctuation.contains(&b))
 }
 
 /// Returns `true` if both are the same text in whatever case, which is how IDs and the names of
@@ -222,6 +236,21 @@ mod tests {
         }
         for name in ["", ".", "..", "a/b", "a\\b", "a.b", "ä", "a\n", too_long] {
             assert!(!is_safe_segment(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn entries_that_a_directory_lists_are_handed_back_if_their_names_could_be_those_of_a_vault() {
+        let conflict = "vault.sync-conflict-20261016-143107-ABCDEFG.json";
+        let longest: &str = &"x".repeat(128);
+        let too_long: &str = &"x".repeat(129);
+
+        for name in ["vault.json.bak", conflict, ".hidden", "a", longest] {
+            assert!(is_entry_name(name), "{name}");
+        }
+        let copy = "vault (conflicted copy).json";
+        for name in ["", ".", "..", "a/b", "a\\b", "ä", "a\n", copy, too_long] {
+            assert!(!is_entry_name(name), "{name}");
         }
     }
 

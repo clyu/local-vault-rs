@@ -1,17 +1,36 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::fs::{FileSystem, IoError};
 
 type Files = BTreeMap<Vec<String>, Vec<u8>>;
 
-/// A [`FileSystem`] that keeps its files in memory, for tests. A directory exists as long as a
-/// file is in it.
+/// A [`FileSystem`] that keeps its files in memory, for tests. Directories are made on the way to
+/// a file that is written, and stay until they are deleted, also once they are empty, as on a
+/// disk.
 ///
 /// Clones share their files, so that a test can look at what the local server wrote.
 #[derive(Debug, Clone, Default)]
 pub struct MemoryFileSystem {
-    files: Arc<Mutex<Files>>,
+    entries: Arc<Mutex<Entries>>,
+}
+
+#[derive(Debug, Default)]
+struct Entries {
+    files: Files,
+    directories: BTreeSet<Vec<String>>,
+}
+
+impl Entries {
+    /// Puts a file at the path, replacing any that is there, with the directories on its way.
+    fn put(&mut self, path: Vec<String>, content: Vec<u8>) {
+        for length in 1..path.len() {
+            if let Some(directory) = path.get(..length) {
+                self.directories.insert(directory.to_vec());
+            }
+        }
+        self.files.insert(path, content);
+    }
 }
 
 impl MemoryFileSystem {
@@ -22,22 +41,27 @@ impl MemoryFileSystem {
 
     /// Returns the content of the file at the path, if there is one.
     pub fn get(&self, path: &[&str]) -> Option<Vec<u8>> {
-        self.files().get(&owned(path)).cloned()
+        self.entries().files.get(&owned(path)).cloned()
     }
 
-    /// Puts a file at the path, replacing any that is there.
+    /// Puts a file at the path, replacing any that is there, with the directories on its way.
     pub fn put(&self, path: &[&str], content: impl Into<Vec<u8>>) {
-        self.files().insert(owned(path), content.into());
+        self.entries().put(owned(path), content.into());
     }
 
     /// Returns the paths of all files, sorted.
     pub fn paths(&self) -> Vec<Vec<String>> {
-        self.files().keys().cloned().collect()
+        self.entries().files.keys().cloned().collect()
     }
 
-    fn files(&self) -> MutexGuard<'_, Files> {
+    /// Returns the paths of all directories, the empty ones among them, sorted.
+    pub fn directories(&self) -> Vec<Vec<String>> {
+        self.entries().directories.iter().cloned().collect()
+    }
+
+    fn entries(&self) -> MutexGuard<'_, Entries> {
         // A test that failed while it held the lock leaves files that are as good as any.
-        self.files
+        self.entries
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -53,22 +77,20 @@ fn is_inside(path: &[String], directory: &[&str]) -> bool {
 
 impl FileSystem for MemoryFileSystem {
     async fn list(&self, directory: &[&str]) -> Result<Vec<String>, IoError> {
-        let mut names: Vec<String> = Vec::new();
-        for path in self.files().keys() {
-            if let Some(name) = path.get(directory.len())
-                && is_inside(path, directory)
-                && !names.contains(name)
-            {
-                names.push(name.clone());
-            }
-        }
-        Ok(names)
+        let entries = self.entries();
+        let paths = entries.files.keys().chain(&entries.directories);
+        let inside = paths.filter(|path| is_inside(path, directory));
+        let names = inside.filter_map(|path| path.get(directory.len()));
+        let names: BTreeSet<&String> = names.collect();
+        Ok(names.into_iter().cloned().collect())
     }
 
     async fn exists(&self, path: &[&str]) -> Result<bool, IoError> {
-        let files = self.files();
-        let is_file = files.contains_key(&owned(path));
-        Ok(is_file || files.keys().any(|p| is_inside(p, path)))
+        let entries = self.entries();
+        let path = owned(path);
+        // The vault folder itself is always there.
+        let is_directory = path.is_empty() || entries.directories.contains(&path);
+        Ok(is_directory || entries.files.contains_key(&path))
     }
 
     async fn read(&self, path: &[&str]) -> Result<Option<Vec<u8>>, IoError> {
@@ -84,21 +106,23 @@ impl FileSystem for MemoryFileSystem {
     }
 
     async fn rename(&self, path: &[&str], new_name: &str) -> Result<bool, IoError> {
-        let mut files = self.files();
-        let Some(content) = files.remove(&owned(path)) else {
+        let mut entries = self.entries();
+        let Some(content) = entries.files.remove(&owned(path)) else {
             return Ok(false);
         };
         let mut new_path = owned(path);
         new_path.pop();
         new_path.push(new_name.to_owned());
-        files.insert(new_path, content);
+        entries.put(new_path, content);
         Ok(true)
     }
 
     async fn delete(&self, path: &[&str]) -> Result<bool, IoError> {
         let target = owned(path);
-        self.files()
-            .retain(|p, _| *p != target && !is_inside(p, path));
+        let mut entries = self.entries();
+        let is_deleted = |p: &Vec<String>| *p == target || is_inside(p, path);
+        entries.files.retain(|p, _| !is_deleted(p));
+        entries.directories.retain(|p| !is_deleted(p));
         Ok(true)
     }
 }

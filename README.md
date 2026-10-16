@@ -23,7 +23,7 @@ both.
 | `crates/local-vault-wasm` | The module for JavaScript, through [wasm-bindgen](https://rustwasm.github.io/wasm-bindgen/). |
 | `crates/uniffi-bindgen` | Generates the Kotlin of `local-vault-uniffi`. |
 
-A client brings three things:
+A client brings four things:
 
 - **The file system of the vault folder**: list, exists, read, write, rename and delete, on paths
   that are lists of names relative to the folder. The operations are asynchronous, as the
@@ -34,6 +34,11 @@ A client brings three things:
 - **The interception point**: where the requests of the client for the host `vault.local.invalid`
   are handed to the local server as they are (method, address, headers, body), and its responses,
   which say their media type, turned into those of the HTTP client.
+- **The ID of its installation**, which is the same every time it starts. Every device writes its
+  changes to a directory of the vault folder named after it, which no other device writes, so
+  that a tool that syncs the folder never has two versions of a file to choose from, and the
+  vault is put together from the files of every device. It is made of 1 to 128 ASCII letters,
+  digits, `-` and `_`, as a UUID is: no local server is created for any other ID.
 
 What a request asks for is worked out here, once for every client: the service it is for, the
 account of its token, its form and its query. The content of attachments is either streamed by
@@ -50,6 +55,7 @@ copy of them:
 | `FLAGS_THAT_MUST_BE_OFF` | Its feature flags that move requests out of reach of the local server: still there, and off by default. |
 | `check_file_system` | Its file system keeps the rules that the vault store counts on. |
 | `accounts_missing_in` | The accounts that it copies when the vault moves to another folder. |
+| `device_files_missing_in` | The files of its device, and the content of attachments, that it copies to the accounts that the other folder already has. |
 
 ## Where the earlier implementations differed
 

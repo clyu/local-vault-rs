@@ -489,6 +489,7 @@ dependencies = [
  "base64",
  "form_urlencoded",
  "futures",
+ "indexmap",
  "pbkdf2",
  "percent-encoding",
  "serde",

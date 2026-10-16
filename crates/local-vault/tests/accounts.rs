@@ -65,7 +65,7 @@ fn an_account_is_registered_and_logs_in_with_its_master_password() {
 
     let vault = vault_file(&fs, &user_id);
     assert_eq!(vault["format"], "bitwarden-local-vault");
-    assert_eq!(vault["version"], 1);
+    assert_eq!(vault["version"], 2);
     assert_eq!(vault["revisionDate"], "2026-10-11T12:00:00.000Z");
     let verifier = &vault["account"]["masterPasswordVerifier"];
     assert_eq!(verifier["algorithm"], "PBKDF2-SHA256");
@@ -77,6 +77,7 @@ fn an_account_is_registered_and_logs_in_with_its_master_password() {
 fn an_email_that_has_an_account_is_not_registered_again() {
     let (client, fs) = browser();
     client.register();
+    let files = fs.paths();
 
     let path = "accounts/register/send-verification-email";
     let verification = client.send_anonymous("POST", path, json!({"email": EMAIL}));
@@ -87,7 +88,7 @@ fn an_email_that_has_an_account_is_not_registered_again() {
     assert_eq!(registered.code, 400);
     let taken = format!("Email '{EMAIL}' is already taken.");
     assert_eq!(message(&registered), taken);
-    assert_eq!(fs.paths().len(), 1);
+    assert_eq!(fs.paths(), files);
 }
 
 #[test]
@@ -372,6 +373,11 @@ fn deleting_the_account_removes_its_vault_and_attachments() {
     let upload = body(&client.send("POST", &path, &token, json!({})));
     let content_path = path_of(upload["url"].as_str().unwrap());
     client.request("PUT", &content_path).bytes(&[1]).send();
+    // The copy that a tool that syncs the folder keeps of a `vault.json` that it had two versions
+    // of, with the whole vault in it.
+    let vault = vault_file(&fs, &user_id).to_string();
+    let conflict = "vault.sync-conflict-20261016-143107-ABCDEFG.json";
+    fs.put(&[user_id.as_str(), conflict], vault);
     let delete = |hash: &str| {
         let body = json!({"MasterPasswordHash": hash});
         client.send("DELETE", "accounts", &token, body)
@@ -381,7 +387,14 @@ fn deleting_the_account_removes_its_vault_and_attachments() {
     assert!(fs.paths().iter().any(|path| path[0] == user_id));
     assert_eq!(delete(PASSWORD_HASH).code, 200);
 
-    assert!(fs.paths().is_empty());
+    // Only that the account was deleted is left of it.
+    let root = [user_id.as_str(), "vault.json"];
+    assert_eq!(fs.paths(), [root]);
+    assert_eq!(fs.directories(), [[user_id.as_str()]]);
+    assert!(client.platform.logs().is_empty());
+    let deleted = json!({"format": "bitwarden-local-vault-deleted"});
+    assert_eq!(read_json(&fs, &root), deleted);
     assert_eq!(client.get("sync", &token).code, 401);
     assert_eq!(client.log_in(EMAIL, PASSWORD_HASH).code, 400);
+    client.register();
 }

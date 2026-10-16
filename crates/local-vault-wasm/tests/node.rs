@@ -151,7 +151,7 @@ const LOGIN: &str = r#"{
 }"#;
 
 fn server(file_system: JsFileSystem) -> WasmLocalServer {
-    let Ok(server) = WasmLocalServer::new(file_system, testPlatform(), "browser") else {
+    let Ok(server) = WasmLocalServer::new(file_system, testPlatform(), "browser", "device") else {
         panic!("The server is not created.");
     };
     server

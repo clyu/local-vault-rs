@@ -35,7 +35,9 @@ impl Error for IoError {}
 ///
 /// Every path is a list of names relative to the vault folder, so an empty list is the folder
 /// itself. The local vault only ever passes names that [`is_safe_segment`] accepts, apart from
-/// the names of the files of a vault, which have a `.` in them.
+/// names with a `.` in them: those of the files of a vault, and those that it lists in the
+/// directory of an account that it deletes, which are made of ASCII letters, digits, `.`, `-` and
+/// `_` as well, and are never `.` or `..`.
 ///
 /// The operations are asynchronous, as a browser extension reaches the folder through messages
 /// to another program. A client whose file system answers right away can implement them as

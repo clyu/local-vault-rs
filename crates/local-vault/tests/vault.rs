@@ -4,6 +4,8 @@
 
 mod common;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use common::*;
 use local_vault::{ClientKind, FileSystem, IoError, LocalResponse, MemoryFileSystem};
 use serde_json::{Value, json};
@@ -293,11 +295,17 @@ fn a_folder_is_created_renamed_and_deleted_along_with_the_references_to_it() {
     let deleted = client.call("DELETE", &path, &token);
 
     assert_eq!(deleted.code, 200);
-    let sync = &vault_file(&fs, &user_id)["sync"];
+    let sync = body(&client.get("sync", &token));
     assert_eq!(sync["folders"], json!([]));
     let folder_ids = field_of_each(&sync["ciphers"], "folderId");
     assert_eq!(folder_ids, [Value::Null, json!("other")]);
     assert_eq!(client.get(&path, &token).code, 404);
+    // The items themselves are not changed, so that a change of one of them on another device is
+    // not lost to the deletion: the one in the folder is in none as the folder was deleted.
+    let file = &vault_file(&fs, &user_id)["sync"];
+    assert_eq!(file["folders"], json!([]));
+    let folder_ids = field_of_each(&file["ciphers"], "folderId");
+    assert_eq!(folder_ids, [folder["id"].clone(), json!("other")]);
 }
 
 #[test]
@@ -311,7 +319,7 @@ fn several_folders_are_deleted_at_once() {
     }
     let in_folder = json!({"type": 1, "folderId": ids[2]});
     client.send("POST", "ciphers", &token, in_folder);
-    let sync = || vault_file(&fs, &user_id)["sync"].clone();
+    let sync = || body(&client.get("sync", &token));
 
     let deleted = json!({"ids": [ids[0]]});
     client.send("DELETE", "folders", &token, deleted);
@@ -321,6 +329,9 @@ fn several_folders_are_deleted_at_once() {
     client.call("DELETE", "folders/all", &token);
     assert_eq!(sync()["folders"], json!([]));
     assert_eq!(sync()["ciphers"][0]["folderId"], json!(null));
+    // The item itself is not changed: it is in no folder as its folder was deleted.
+    let file = vault_file(&fs, &user_id);
+    assert_eq!(file["sync"]["ciphers"][0]["folderId"], json!(ids[2]));
 }
 
 #[test]
@@ -414,26 +425,49 @@ fn an_attachment_is_created_uploaded_downloaded_and_deleted() {
     assert_eq!(stored["revisionDate"], updated["revisionDate"]);
     assert_eq!(client.request("GET", &content_path).send().code, 404);
     assert_eq!(client.get(&attachment_path, &token).code, 404);
+    // The content is kept until nothing can bring the attachment back, but not handed out.
+    assert_eq!(fs.get(&file).unwrap(), content);
+    let removed = format!("{cipher_id}/{attachment_id}");
+    let removed_at = &vault_file(&fs, &user_id)["removedAttachments"][&removed];
+    assert_eq!(*removed_at, NOON + 45 * MINUTE);
+
+    // Then it is deleted. The directory of the content of the item stays, as the vault still has
+    // the item, and the content of a new attachment of it can be on its way there.
+    client.platform.set_now(NOON + 45 * MINUTE + GRACE);
+    client.get("sync", &token);
+    assert_eq!(fs.get(&file), None);
+    assert!(block_on_exists(&fs, &file[..3]));
 }
 
 #[test]
-fn the_attachments_of_a_cipher_that_is_deleted_are_removed() {
+fn the_attachments_of_a_cipher_that_is_deleted_are_removed_once_nothing_can_bring_it_back() {
     let (client, fs) = browser();
     let (token, user_id) = client.register_and_log_in();
     let cipher = body(&client.send("POST", "ciphers", &token, json!({"type": 1})));
-    upload_attachment(&client, &token, &id(&cipher));
+    let cipher_id = id(&cipher);
+    upload_attachment(&client, &token, &cipher_id);
+    let attachments = [user_id.as_str(), "attachments"];
+    let of_item = [user_id.as_str(), "attachments", cipher_id.as_str()];
 
     // The files are named after the ID that the item has, in whatever case a request names it.
-    let path = format!("ciphers/{}", id(&cipher).to_uppercase());
+    let path = format!("ciphers/{}", cipher_id.to_uppercase());
     client.call("DELETE", &path, &token);
+    client.get("sync", &token);
 
-    let attachments = [user_id.as_str(), "attachments"];
-    assert!(!block_on_exists(&fs, &attachments));
+    // A device that has not seen the deletion yet can still bring the item back with a change.
+    assert!(block_on_exists(&fs, &of_item));
+    client.platform.set_now(NOON + GRACE);
+    client.get("sync", &token);
+
+    // The directory of the content of the item goes with it, as the vault no longer has the item.
+    assert!(!block_on_exists(&fs, &of_item));
+    assert!(block_on_list(&fs, &attachments).is_empty());
+    assert_eq!(vault_file(&fs, &user_id)["removedAttachments"], json!({}));
     assert!(client.platform.logs().is_empty());
 }
 
 #[test]
-fn files_of_attachments_that_cannot_be_deleted_are_reported() {
+fn the_content_of_attachments_that_cannot_be_deleted_is_deleted_the_next_time() {
     for fails_with_error in [false, true] {
         let fs = MemoryFileSystem::new();
         let failing = NoDelete {
@@ -446,16 +480,53 @@ fn files_of_attachments_that_cannot_be_deleted_are_reported() {
         upload_attachment(&client, &token, &id(&cipher));
 
         let deleted = client.call("DELETE", &format!("ciphers/{}", id(&cipher)), &token);
+        client.platform.set_now(NOON + GRACE);
+        let synced = client.get("sync", &token);
 
-        // The item is gone from the vault, which is what the request is for.
+        // The item is gone from the vault, which is what the request is for, and the content of
+        // its attachment is still to be deleted.
         assert_eq!(deleted.code, 200);
-        assert_eq!(vault_file(&fs, &user_id)["sync"]["ciphers"], json!([]));
+        assert_eq!(synced.code, 200);
+        let file = vault_file(&fs, &user_id);
+        assert_eq!(file["sync"]["ciphers"], json!([]));
         let attachments = [user_id.as_str(), "attachments"];
         assert!(block_on_exists(&fs, &attachments));
-        let left_behind = "Local server could not delete files of attachments that the vault \
-                           no longer has.";
-        assert_eq!(client.platform.logs(), [left_behind]);
+        let removed = file["removedAttachments"].as_object().unwrap();
+        assert_eq!(removed.len(), 1);
+        assert!(client.platform.logs().is_empty());
     }
+}
+
+#[test]
+fn a_file_that_could_not_be_tidied_is_tidied_at_the_next_sync() {
+    let fs = MemoryFileSystem::new();
+    let full = Full {
+        fs: fs.clone(),
+        is_full: AtomicBool::new(false),
+    };
+    let client = Client::on(full, TestPlatform::at(NOON), ClientKind::Browser);
+    let (token, user_id) = client.register_and_log_in();
+    let cipher = body(&client.send("POST", "ciphers", &token, json!({"type": 1})));
+    upload_attachment(&client, &token, &id(&cipher));
+    client.call("DELETE", &format!("ciphers/{}", id(&cipher)), &token);
+    let removed = || vault_file(&fs, &user_id)["removedAttachments"].clone();
+    let failed = "Local server could not leave out of its file what other devices replaced.";
+
+    // The vault folder is full when the device first looks at its file, which the sync itself
+    // does not need.
+    let is_full = &client.server.file_system().is_full;
+    is_full.store(true, Ordering::SeqCst);
+    client.platform.set_now(NOON + GRACE);
+    assert_eq!(client.get("sync", &token).code, 200);
+    is_full.store(false, Ordering::SeqCst);
+    assert_eq!(client.platform.logs(), [failed]);
+    assert_eq!(removed().as_object().unwrap().len(), 1);
+
+    // It looks again at the next sync, not a day later.
+    client.platform.set_now(NOON + GRACE + MINUTE);
+    assert_eq!(client.get("sync", &token).code, 200);
+    assert_eq!(removed(), json!({}));
+    assert_eq!(client.platform.logs(), [failed]);
 }
 
 #[test]
@@ -593,7 +664,13 @@ fn purging_the_vault_removes_every_item_folder_and_attachment() {
     let sync = &vault_file(&fs, &user_id)["sync"];
     assert_eq!(sync["ciphers"], json!([]));
     assert_eq!(sync["folders"], json!([]));
-    assert!(!block_on_exists(&fs, &[user_id.as_str(), "attachments"]));
+    // The content of the attachments is deleted once nothing can bring them back, and so are the
+    // directories that held it.
+    let attachments = [user_id.as_str(), "attachments"];
+    assert!(!block_on_list(&fs, &attachments).is_empty());
+    client.platform.set_now(NOON + GRACE);
+    client.get("sync", &token);
+    assert!(block_on_list(&fs, &attachments).is_empty());
 }
 
 /// Adds an attachment to the item and uploads its content.
@@ -611,6 +688,10 @@ fn put_one_byte(client: &Client<MemoryFileSystem>, path: &str) -> LocalResponse 
 
 fn block_on_exists(fs: &MemoryFileSystem, path: &[&str]) -> bool {
     futures::executor::block_on(fs.exists(path)).unwrap()
+}
+
+fn block_on_list(fs: &MemoryFileSystem, directory: &[&str]) -> Vec<String> {
+    futures::executor::block_on(fs.list(directory)).unwrap()
 }
 
 /// A file system that does not delete attachments: it fails to, or leaves them where they are.
@@ -649,5 +730,41 @@ impl FileSystem for NoDelete {
         } else {
             Ok(false)
         }
+    }
+}
+
+/// A vault folder on a drive that can be full, where nothing can be written then, but what is
+/// there can be read and deleted.
+struct Full {
+    fs: MemoryFileSystem,
+    is_full: AtomicBool,
+}
+
+impl FileSystem for Full {
+    async fn list(&self, directory: &[&str]) -> Result<Vec<String>, IoError> {
+        self.fs.list(directory).await
+    }
+
+    async fn exists(&self, path: &[&str]) -> Result<bool, IoError> {
+        self.fs.exists(path).await
+    }
+
+    async fn read(&self, path: &[&str]) -> Result<Option<Vec<u8>>, IoError> {
+        self.fs.read(path).await
+    }
+
+    async fn write(&self, path: &[&str], content: &[u8]) -> Result<(), IoError> {
+        if self.is_full.load(Ordering::SeqCst) {
+            return Err(IoError::new("The drive is full."));
+        }
+        self.fs.write(path, content).await
+    }
+
+    async fn rename(&self, path: &[&str], new_name: &str) -> Result<bool, IoError> {
+        self.fs.rename(path, new_name).await
+    }
+
+    async fn delete(&self, path: &[&str]) -> Result<bool, IoError> {
+        self.fs.delete(path).await
     }
 }

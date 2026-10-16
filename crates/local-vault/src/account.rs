@@ -5,22 +5,23 @@ use serde_json::{Value, json};
 
 use crate::fs::FileSystem;
 use crate::http::{
-    HTTP_BAD_REQUEST, HTTP_INTERNAL_ERROR, HTTP_TOO_MANY_REQUESTS, LocalRequest, bad_request,
-    error_response, invalid_request_response, ok_empty_response, ok_response,
+    HTTP_BAD_REQUEST, HTTP_TOO_MANY_REQUESTS, LocalRequest, bad_request, error_response,
+    invalid_request_response, ok_empty_response, ok_response,
 };
 use crate::json::{
     JsonObject, int, int_or_null, into_object, is_blank, obj, string, string_or_null, with_fields,
 };
-use crate::platform::Platform;
+use crate::platform::{LogLevel, Platform};
 use crate::server::{ClientKind, LocalServer, Outcome};
-use crate::store::{KEY_ACCOUNT, KEY_SYNC};
+use crate::store::{KEY_ACCOUNT, KEY_SYNC, ReadVault};
 use crate::verifier::{create_verifier, matches_verifier};
 
 /// The field of the account that holds what the master password is recognized by.
 pub(crate) const KEY_PASSWORD_VERIFIER: &str = "masterPasswordVerifier";
 
 const INVALID_PASSWORD_MESSAGE: &str = "Invalid master password.";
-const NOT_DELETED_MESSAGE: &str = "The account could not be deleted from the vault folder.";
+const FILES_LEFT_BEHIND_MESSAGE: &str =
+    "Files of an account that was deleted could not be deleted from the vault folder.";
 const ANOTHER_USER_KEY_MESSAGE: &str = "This is not the ID of the user key of the account.";
 const NO_HINT_MESSAGE: &str = "There is no master password hint for this email.";
 
@@ -56,7 +57,7 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
     pub(crate) async fn change_password(
         &self,
         user_id: &str,
-        vault: &JsonObject,
+        vault: &ReadVault,
         request: &LocalRequest,
     ) -> Outcome {
         let body = request.json_body()?;
@@ -74,7 +75,8 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
                 ("securityStamp", Value::String(self.new_id())),
             ],
         );
-        self.save(user_id, &with_profile(&updated, profile)).await?;
+        let updated = with_profile(&updated, profile);
+        self.save(user_id, vault, &updated).await?;
         Ok(ok_empty_response())
     }
 
@@ -82,7 +84,7 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
     pub(crate) async fn update_kdf(
         &self,
         user_id: &str,
-        vault: &JsonObject,
+        vault: &ReadVault,
         request: &LocalRequest,
     ) -> Outcome {
         let body = request.json_body()?;
@@ -92,7 +94,7 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
         let Some(updated) = self.with_master_password(vault, &body) else {
             return Ok(invalid_request_response());
         };
-        self.save(user_id, &updated).await?;
+        self.save(user_id, vault, &updated).await?;
         Ok(ok_empty_response())
     }
 
@@ -104,7 +106,7 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
     pub(crate) async fn record_user_key_id(
         &self,
         user_id: &str,
-        vault: &JsonObject,
+        vault: &ReadVault,
         request: &LocalRequest,
     ) -> Outcome {
         let body = request.json_body()?;
@@ -123,13 +125,15 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
         let user_decryption = with_fields(&user_decryption, [("userKeyId", user_key_id.into())]);
         let sync = with_fields(sync, [("userDecryption", Value::Object(user_decryption))]);
         let updated = with_fields(vault, [(KEY_SYNC, Value::Object(sync))]);
-        self.save(user_id, &updated).await?;
+        self.save(user_id, vault, &updated).await?;
         Ok(ok_empty_response())
     }
 
     /// Deletes the vault of the account, along with its attachments. An account that could not
     /// be deleted is not reported as deleted: the client would sign it out as if it were gone,
-    /// while it can still be signed in to.
+    /// while it can still be signed in to. Files of an account that was deleted that could not be
+    /// deleted are reported and left behind, as nothing reads them: the client would be told
+    /// that the account is still there, and find it gone at its next request.
     pub(crate) async fn delete_account(
         &self,
         user_id: &str,
@@ -141,7 +145,8 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
             return Ok(bad_request(INVALID_PASSWORD_MESSAGE));
         }
         if !self.store.delete_account(user_id).await? {
-            return Ok(error_response(HTTP_INTERNAL_ERROR, NOT_DELETED_MESSAGE));
+            self.platform
+                .log(LogLevel::Warning, FILES_LEFT_BEHIND_MESSAGE);
         }
         Ok(ok_empty_response())
     }

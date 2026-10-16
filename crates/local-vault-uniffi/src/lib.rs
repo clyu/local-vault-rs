@@ -171,16 +171,24 @@ pub struct LocalVaultServer {
 
 #[uniffi::export]
 impl LocalVaultServer {
-    /// A local server on the vault folder that the file system reaches.
+    /// A local server on the vault folder that the file system reaches, for the installation of
+    /// the app with the ID: the UUID that the app identifies itself to a Bitwarden server with,
+    /// which is the same every time. The app writes its changes to a directory of the vault
+    /// folder named after it, which no other device writes.
+    ///
+    /// Fails with [`LocalVaultError::Io`] if the ID cannot be the name of a directory, as the
+    /// local server would write nothing with it: every request that changes the vault would fail.
     #[uniffi::constructor]
     pub fn new(
         file_system: Box<dyn VaultFileSystem>,
         platform: Box<dyn VaultPlatform>,
         client: VaultClientKind,
-    ) -> Arc<Self> {
+        device_id: String,
+    ) -> Result<Arc<Self>, LocalVaultError> {
         let file_system = AppFileSystem(file_system);
-        let server = LocalServer::new(file_system, AppPlatform(platform), client.into());
-        Arc::new(Self { server })
+        let platform = AppPlatform(platform);
+        let server = LocalServer::new(file_system, platform, client.into(), &device_id)?;
+        Ok(Arc::new(Self { server }))
     }
 
     /// Answers a request. Requests are handled one at a time: a call waits for the one before
@@ -273,6 +281,23 @@ pub fn accounts_missing_in(
     let target = AppFileSystem(target);
     let missing = block_on(local_vault::accounts_missing_in(&source, &target))?;
     Ok(missing)
+}
+
+/// The files that the app copies of the accounts that the vault folders of both the source and
+/// the target have, when the vault moves to the target, as the installation of the app with the
+/// ID: the content of attachments that the target does not have, and the files that the app
+/// wrote last in its own directory of the account. Each is a path from the vault folder, in the
+/// order in which they are copied.
+#[uniffi::export]
+pub fn device_files_missing_in(
+    source: Box<dyn VaultFileSystem>,
+    target: Box<dyn VaultFileSystem>,
+    device_id: String,
+) -> Result<Vec<Vec<String>>, LocalVaultError> {
+    let source = AppFileSystem(source);
+    let target = AppFileSystem(target);
+    let missing = local_vault::device_files_missing_in(&source, &target, &device_id);
+    Ok(block_on(missing)?)
 }
 
 /// Checks that the file system keeps the rules that the local vault counts on, in the directory
@@ -448,7 +473,12 @@ mod tests {
         let fs = MemoryFileSystem::new();
         let file_system = Box::new(MemoryCallback(fs.clone()));
         let platform = Box::new(Clock(Mutex::new(Vec::new())));
-        let server = LocalVaultServer::new(file_system, platform, VaultClientKind::Android);
+        let device = "11111111-2222-4333-8444-555555555555";
+        let android = VaultClientKind::Android;
+        let created = LocalVaultServer::new(file_system, platform, android, device.to_owned());
+        let Ok(server) = created else {
+            panic!("The server is not created.");
+        };
         let registration = r#"{
             "email": "user@example.com",
             "userAsymmetricKeys": {"publicKey": "a", "encryptedPrivateKey": "b"},
@@ -472,7 +502,23 @@ mod tests {
         assert_eq!(registered.code, 200);
         assert_eq!(registered.content_type, json);
         assert_eq!(hint.ok().map(|response| response.code), Some(429));
-        assert_eq!(fs.paths().len(), 1);
+        // The vault is in the file of the device, and `vault.json` of the account only says
+        // which layout it has.
+        let paths = fs.paths();
+        assert_eq!(paths.len(), 2);
+        let is_of_device = |path: &Vec<String>| path.get(2).is_some_and(|name| name == device);
+        assert!(paths.iter().any(is_of_device));
+    }
+
+    #[test]
+    fn no_server_is_created_for_a_device_id_that_cannot_be_the_name_of_a_directory() {
+        for device in ["", "..", "a/b", "a b"] {
+            let file_system = Box::new(MemoryCallback(MemoryFileSystem::new()));
+            let platform = Box::new(Clock(Mutex::new(Vec::new())));
+            let android = VaultClientKind::Android;
+            let created = LocalVaultServer::new(file_system, platform, android, device.to_owned());
+            assert!(created.is_err(), "{device}");
+        }
     }
 
     #[test]

@@ -25,6 +25,7 @@ mod http;
 mod identity;
 mod json;
 mod memory_fs;
+mod merge;
 mod platform;
 mod server;
 mod store;
@@ -43,5 +44,7 @@ pub use json::is_safe_segment;
 pub use memory_fs::MemoryFileSystem;
 pub use platform::{LogLevel, Platform};
 pub use server::{ClientKind, FLAGS_THAT_MUST_BE_OFF, FlagRule, LocalServer, is_answered};
-pub use store::{LOCAL_VAULT_FORMAT, LOCAL_VAULT_VERSION, accounts_missing_in};
+pub use store::{
+    LOCAL_VAULT_FORMAT, LOCAL_VAULT_VERSION, accounts_missing_in, device_files_missing_in,
+};
 pub use vault::{ATTACHMENTS_PATH, LOCAL_VAULT_HOST};

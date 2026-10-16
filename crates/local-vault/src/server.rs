@@ -10,9 +10,9 @@ use crate::http::{
     InvalidRequest, LocalRequest, LocalResponse, ResponseBody, invalid_request_response, is_uuid,
     list_response, ok_empty_response, ok_response, unauthorized_response, unsupported_response,
 };
-use crate::json::{JsonObject, with_fields};
+use crate::json::{JsonObject, is_safe_segment, with_fields};
 use crate::platform::{LogLevel, Platform, new_uuid};
-use crate::store::{KEY_REVISION_DATE, LocalVaultStore, as_strs};
+use crate::store::{KEY_REVISION_DATE, LocalVaultStore, ReadError, ReadVault, as_strs};
 use crate::token::user_id_of_access_token;
 use crate::vault::{ATTACHMENTS_PATH, get_attachment, get_cipher, get_folder, renew_attachment};
 
@@ -20,6 +20,15 @@ use crate::vault::{ATTACHMENTS_PATH, get_attachment, get_cipher, get_folder, ren
 const SERVER_VERSION: &str = "2026.9.0";
 
 const ATTACHMENT_GONE_MESSAGE: &str = "The content of the attachment is gone.";
+
+const DEVICE_ID_MESSAGE: &str =
+    "The device ID is made of 1 to 128 ASCII letters, digits, \"-\" and \"_\".";
+
+const TIDY_FAILED_MESSAGE: &str =
+    "Local server could not leave out of its file what other devices replaced.";
+
+/// How often the local server looks for what its file of an account no longer has to hold.
+const TIDY_INTERVAL_MILLIS: i64 = 24 * 60 * 60 * 1000;
 
 /// The client that the local server answers, for the one thing that it does differently for
 /// each: what tells the client the master password hint.
@@ -105,6 +114,9 @@ pub struct LocalServer<F, P> {
 pub(crate) struct State {
     /// The `sync` part of each vault as of the last time it was returned in full.
     pub(crate) synced_vaults: HashMap<String, Value>,
+    /// When the file of this device was last looked at for what it no longer has to hold, for
+    /// each account.
+    tidied: HashMap<String, i64>,
 }
 
 /// Why a request was not answered.
@@ -191,14 +203,29 @@ enum AccountRoute<'a> {
 }
 
 impl<F: FileSystem, P: Platform> LocalServer<F, P> {
-    /// A local server on the vault folder that the file system reaches.
-    pub fn new(file_system: F, platform: P, client: ClientKind) -> Self {
-        Self {
-            store: LocalVaultStore::new(file_system),
+    /// A local server on the vault folder that the file system reaches, for the device with the
+    /// ID.
+    ///
+    /// The ID is that of this installation of the client, such as the UUID that it identifies
+    /// itself to a Bitwarden server with, and is the same every time. It names the directory
+    /// that the device writes its changes to, which no other device writes: it is made of 1 to
+    /// 128 ASCII letters, digits, `-` and `_`. Fails for any other ID, as the local server could
+    /// write nothing with it: every request that changes the vault would fail.
+    pub fn new(
+        file_system: F,
+        platform: P,
+        client: ClientKind,
+        device_id: &str,
+    ) -> Result<Self, IoError> {
+        if !is_safe_segment(device_id) {
+            return Err(IoError::new(DEVICE_ID_MESSAGE));
+        }
+        Ok(Self {
+            store: LocalVaultStore::new(file_system, device_id),
             platform,
             client,
             state: Mutex::new(State::default()),
-        }
+        })
     }
 
     /// The file system that the vault folder is reached through.
@@ -208,8 +235,8 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
 
     /// Answers a request the way the Bitwarden server would.
     ///
-    /// Requests are handled one at a time, as each of them reads and then replaces the whole
-    /// vault: a request that comes while another one is handled waits for it.
+    /// Requests are handled one at a time, as each of them reads the whole vault and then writes
+    /// what changed in it: a request that comes while another one is handled waits for it.
     ///
     /// Fails only if the vault folder cannot be reached, which a client reports as a request
     /// that did not reach its server. Every other failure is a response, in the format that the
@@ -300,7 +327,7 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
         let Some(user_id) = user_id else {
             return Ok(unauthorized_response());
         };
-        let Some(vault) = self.store.read_vault(&user_id).await? else {
+        let Some(vault) = self.read_vault(&user_id).await? else {
             return Ok(unauthorized_response());
         };
         self.run(route, &user_id, &vault, request, state).await
@@ -310,13 +337,16 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
         &self,
         route: AccountRoute<'_>,
         user_id: &str,
-        vault: &JsonObject,
+        vault: &ReadVault,
         request: &LocalRequest,
         state: &mut State,
     ) -> Outcome {
         use AccountRoute as R;
         match route {
-            R::Sync => Ok(self.sync(user_id, vault, state)),
+            R::Sync => {
+                self.tidy(user_id, state).await;
+                Ok(self.sync(user_id, vault, state))
+            }
             R::RevisionDate => Ok(self.revision_date(user_id, vault, state)),
             R::CreateCipher => self.create_cipher(user_id, vault, request).await,
             R::CreateCipherWithCollections => {
@@ -384,18 +414,85 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
         new_uuid(&self.platform)
     }
 
-    /// Replaces the vault of the account with the vault, which is changed as of now.
-    pub(crate) async fn save(&self, user_id: &str, vault: &JsonObject) -> Result<(), IoError> {
-        let vault = with_fields(vault, [(KEY_REVISION_DATE, Value::String(self.now()))]);
-        self.store.write_vault(user_id, &vault).await
+    /// Writes the change of the vault of the account from the vault that was read to the vault
+    /// that is given, which it comes to as of now.
+    pub(crate) async fn save(
+        &self,
+        user_id: &str,
+        read: &ReadVault,
+        vault: &JsonObject,
+    ) -> Result<(), IoError> {
+        let now = self.platform.now_millis();
+        let vault = with_fields(
+            vault,
+            [(KEY_REVISION_DATE, Value::String(format_date(now)))],
+        );
+        self.store.write_vault(user_id, read, &vault, now).await
     }
 
-    /// Returns the vault of the account with the email, the first one if there are several.
-    pub(crate) async fn first_vault_of(&self, email: &str) -> Result<Option<JsonObject>, IoError> {
-        match self.store.find_account_id(email).await? {
-            Some(account_id) => self.store.read_vault(&account_id).await,
-            None => Ok(None),
+    /// Leaves out of the file of this device what it no longer has to hold for the account, and
+    /// deletes the content of the attachments that it removed once nothing can bring them back,
+    /// once a day at most. It is done when the client syncs, which is when the changes of other
+    /// devices come in. A failure is only logged, as the vault is the same either way, and is
+    /// tried again at the next sync: this is also what leaves a master password that another
+    /// device replaced out of the file.
+    async fn tidy(&self, user_id: &str, state: &mut State) {
+        let now = self.platform.now_millis();
+        let last = state.tidied.get(user_id).copied();
+        if last.is_some_and(|last| now.saturating_sub(last) < TIDY_INTERVAL_MILLIS) {
+            return;
         }
+        if self.store.tidy(user_id, now).await.is_ok() {
+            state.tidied.insert(user_id.to_owned(), now);
+        } else {
+            self.platform.log(LogLevel::Warning, TIDY_FAILED_MESSAGE);
+        }
+    }
+
+    /// Returns the vault of the account with the email, the first one if there are several,
+    /// without its folders and items (see [`Self::find_accounts`]).
+    pub(crate) async fn first_vault_of(&self, email: &str) -> Result<Option<JsonObject>, IoError> {
+        let accounts = self.find_accounts(email).await?;
+        Ok(accounts.into_iter().next().map(|(_, vault)| vault))
+    }
+
+    /// Returns the vault of the account, which a change of it is written against, or `None` if
+    /// the account is not there (see [`LocalVaultStore::read_vault`]).
+    pub(crate) async fn read_vault(&self, user_id: &str) -> Result<Option<ReadVault>, IoError> {
+        self.reported(self.store.read_vault(user_id).await)
+    }
+
+    /// Returns the vault of the account without its folders and items, or `None` if the account
+    /// is not there (see [`LocalVaultStore::read_account`]).
+    pub(crate) async fn read_account(&self, user_id: &str) -> Result<Option<JsonObject>, IoError> {
+        self.reported(self.store.read_account(user_id).await)
+    }
+
+    /// Returns the accounts with the email by their IDs, each with its vault without its folders
+    /// and items, which a request that looks for an account by its email does not need (see
+    /// [`LocalVaultStore::find_accounts`]).
+    pub(crate) async fn find_accounts(
+        &self,
+        email: &str,
+    ) -> Result<Vec<(String, JsonObject)>, IoError> {
+        self.reported(self.store.find_accounts(email).await)
+    }
+
+    /// What a request fails with when the vault of an account, or the account with an email,
+    /// could not be read. A client only reports it as a request that did not reach its server,
+    /// so an account whose vault cannot be used for now is logged with its ID, which is the name
+    /// of its directory in the vault folder: the files of an account can keep from coming for
+    /// good, and the directory then has to be found to be deleted by hand.
+    fn reported<T>(&self, read: Result<T, ReadError>) -> Result<T, IoError> {
+        read.map_err(|error| match error {
+            ReadError::Io(error) => error,
+            ReadError::Unusable(account_id, why) => {
+                let reason = why.message();
+                let message = format!("Local server cannot use account {account_id}: {reason}");
+                self.platform.log(LogLevel::Warning, &message);
+                IoError::new(reason)
+            }
+        })
     }
 }
 

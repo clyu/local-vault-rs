@@ -20,6 +20,8 @@ pub const EMAIL: &str = "user@example.com";
 pub const PASSWORD_HASH: &str = "cGFzc3dvcmQtaGFzaA==";
 pub const USER_KEY: &str = "2.userKey|iv|mac";
 pub const UNKNOWN_ID: &str = "00000000-0000-4000-8000-000000000000";
+/// The ID of the device of a client, unless a test says otherwise.
+pub const DEVICE: &str = "device-a";
 pub const UNSUPPORTED_MESSAGE: &str =
     "This feature needs a Bitwarden server and is not available with a local vault.";
 
@@ -29,6 +31,10 @@ const GOLDEN_GAMMA: u64 = 0x9e37_79b9_7f4a_7c15;
 /// 2026-10-11T12:00:00.000Z.
 pub const NOON: i64 = 1_791_720_000_000;
 pub const MINUTE: i64 = 60_000;
+pub const DAY: i64 = 24 * 60 * MINUTE;
+/// How long a device holds what another device replaced, and the content of an attachment that
+/// it removed.
+pub const GRACE: i64 = 90 * DAY;
 
 /// A [`Platform`] with a clock that the test sets, random bytes that are the same in every run,
 /// and a log that the test reads.
@@ -48,6 +54,14 @@ impl TestPlatform {
     pub fn at(millis: i64) -> Self {
         let platform = Self::default();
         platform.set_now(millis);
+        platform
+    }
+
+    /// A platform whose random bytes are others than those of a platform with another seed, as
+    /// those of two devices are.
+    pub fn seeded(millis: i64, seed: u64) -> Self {
+        let platform = Self::at(millis);
+        platform.inner.random.store(seed, Ordering::SeqCst);
         platform
     }
 
@@ -104,7 +118,11 @@ impl Client<MemoryFileSystem> {
 
 impl<F: FileSystem> Client<F> {
     pub fn on(fs: F, platform: TestPlatform, kind: ClientKind) -> Self {
-        let server = LocalServer::new(fs, platform.clone(), kind);
+        Self::on_device(fs, platform, kind, DEVICE)
+    }
+
+    pub fn on_device(fs: F, platform: TestPlatform, kind: ClientKind, device_id: &str) -> Self {
+        let server = LocalServer::new(fs, platform.clone(), kind, device_id).unwrap();
         Self { server, platform }
     }
 
@@ -294,14 +312,21 @@ pub fn read_json(fs: &MemoryFileSystem, path: &[&str]) -> Value {
     serde_json::from_slice(&fs.get(path).unwrap()).unwrap()
 }
 
-/// The `vault.json` of the account.
-pub fn vault_file(fs: &MemoryFileSystem, user_id: &str) -> Value {
-    read_json(fs, &[user_id, "vault.json"])
+/// The path of the file of the vault of the account that the device writes.
+pub fn device_file<'a>(user_id: &'a str, device_id: &'a str) -> [&'a str; 4] {
+    [user_id, "devices", device_id, "vault.json"]
 }
 
-/// Replaces the `vault.json` of the account, as another device does.
+/// The file of the vault of the account that the device of a client writes, which holds the
+/// whole vault as long as no other device has written it.
+pub fn vault_file(fs: &MemoryFileSystem, user_id: &str) -> Value {
+    read_json(fs, &device_file(user_id, DEVICE))
+}
+
+/// Replaces the file of the vault of the account that the device of a client writes, as a
+/// device does that has the same ID.
 pub fn replace_vault_file(fs: &MemoryFileSystem, user_id: &str, vault: &Value) {
-    fs.put(&[user_id, "vault.json"], vault.to_string());
+    fs.put(&device_file(user_id, DEVICE), vault.to_string());
 }
 
 /// The path of an address that the local server handed out.

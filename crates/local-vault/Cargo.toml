@@ -11,6 +11,7 @@ publish.workspace = true
 base64.workspace = true
 form_urlencoded.workspace = true
 futures = { workspace = true, features = ["std"] }
+indexmap.workspace = true
 pbkdf2.workspace = true
 percent-encoding.workspace = true
 serde.workspace = true

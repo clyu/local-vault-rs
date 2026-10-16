@@ -15,9 +15,9 @@ use crate::json::{
     JsonObject, element, eq_ignore_case, int, into_object, obj, objects, string, strings, text,
     with_fields, without_fields,
 };
-use crate::platform::{LogLevel, Platform};
+use crate::platform::Platform;
 use crate::server::{LocalServer, Outcome, State};
-use crate::store::{KEY_REVISION_DATE, KEY_SYNC};
+use crate::store::{KEY_REVISION_DATE, KEY_SYNC, ReadVault};
 
 /// The host of the addresses that the local server hands out for the content of attachments,
 /// and of the addresses that a client has in place of those of a server. It is reserved, so it
@@ -54,8 +54,6 @@ const ENCRYPTED_FOR_ANOTHER_MESSAGE: &str =
 const ENCRYPTED_BY_ANOTHER_KEY_MESSAGE: &str =
     "The item was not encrypted with the user key of this account. Sync your vault and try again.";
 const INVALID_PASSWORD_MESSAGE: &str = "Invalid master password.";
-const FILES_LEFT_BEHIND_MESSAGE: &str =
-    "Local server could not delete files of attachments that the vault no longer has.";
 
 impl<F: FileSystem, P: Platform> LocalServer<F, P> {
     /// Returns the whole vault, and remembers what it returned.
@@ -96,7 +94,7 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
     pub(crate) async fn create_cipher(
         &self,
         user_id: &str,
-        vault: &JsonObject,
+        vault: &ReadVault,
         request: &LocalRequest,
     ) -> Outcome {
         self.add_cipher(user_id, vault, &request.json_body()?).await
@@ -108,7 +106,7 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
     pub(crate) async fn create_cipher_with_collections(
         &self,
         user_id: &str,
-        vault: &JsonObject,
+        vault: &ReadVault,
         request: &LocalRequest,
     ) -> Outcome {
         match obj(&request.json_body()?, "cipher") {
@@ -121,7 +119,7 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
     pub(crate) async fn update_cipher(
         &self,
         user_id: &str,
-        vault: &JsonObject,
+        vault: &ReadVault,
         cipher_id: &str,
         request: &LocalRequest,
     ) -> Outcome {
@@ -138,7 +136,7 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
         let id = id_of(&existing, cipher_id);
         let cipher = to_cipher(&body, &id, Some(&existing), &self.now());
         let updated = with_item(vault, CIPHERS, &cipher);
-        self.save(user_id, &updated).await?;
+        self.save(user_id, vault, &updated).await?;
         Ok(ok_response(&Value::Object(cipher)))
     }
 
@@ -147,7 +145,7 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
     pub(crate) async fn update_cipher_partially(
         &self,
         user_id: &str,
-        vault: &JsonObject,
+        vault: &ReadVault,
         cipher_id: &str,
         request: &LocalRequest,
     ) -> Outcome {
@@ -166,7 +164,7 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
             ],
         );
         let updated = with_item(vault, CIPHERS, &cipher);
-        self.save(user_id, &updated).await?;
+        self.save(user_id, vault, &updated).await?;
         Ok(ok_response(&Value::Object(cipher)))
     }
 
@@ -174,7 +172,7 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
     pub(crate) async fn move_ciphers(
         &self,
         user_id: &str,
-        vault: &JsonObject,
+        vault: &ReadVault,
         request: &LocalRequest,
     ) -> Outcome {
         let body = request.json_body()?;
@@ -184,15 +182,16 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
         let updated = with_each_item(vault, CIPHERS, &ids, |cipher| {
             with_fields(cipher, [("folderId", folder_id.clone())])
         });
-        self.save(user_id, &updated).await?;
+        self.save(user_id, vault, &updated).await?;
         Ok(ok_empty_response())
     }
 
-    /// Removes an item and its attachments from the vault.
+    /// Removes an item and its attachments from the vault. The content of the attachments is
+    /// deleted later, once nothing can bring the item back (see `LocalVaultStore::tidy`).
     pub(crate) async fn delete_cipher(
         &self,
         user_id: &str,
-        vault: &JsonObject,
+        vault: &ReadVault,
         cipher_id: &str,
     ) -> Outcome {
         let Some(cipher) = item(vault, CIPHERS, cipher_id) else {
@@ -200,26 +199,21 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
         };
         let id = id_of(&cipher, cipher_id);
         let updated = without_items(vault, CIPHERS, std::slice::from_ref(&id));
-        self.save(user_id, &updated).await?;
-        let deletion = self.store.delete_attachments(user_id, &id).await;
-        self.report_files_left_behind(deletion);
+        self.save(user_id, vault, &updated).await?;
         Ok(ok_empty_response())
     }
 
-    /// Removes several items and their attachments from the vault.
+    /// Removes several items and their attachments from the vault, as [`Self::delete_cipher`]
+    /// does.
     pub(crate) async fn delete_ciphers(
         &self,
         user_id: &str,
-        vault: &JsonObject,
+        vault: &ReadVault,
         request: &LocalRequest,
     ) -> Outcome {
         let ids = existing_ids(vault, CIPHERS, &strings(&request.json_body()?, "ids"));
         let updated = without_items(vault, CIPHERS, &ids);
-        self.save(user_id, &updated).await?;
-        for id in ids {
-            let deletion = self.store.delete_attachments(user_id, &id).await;
-            self.report_files_left_behind(deletion);
-        }
+        self.save(user_id, vault, &updated).await?;
         Ok(ok_empty_response())
     }
 
@@ -227,7 +221,7 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
     pub(crate) async fn soft_delete_cipher(
         &self,
         user_id: &str,
-        vault: &JsonObject,
+        vault: &ReadVault,
         cipher_id: &str,
     ) -> Outcome {
         if item(vault, CIPHERS, cipher_id).is_none() {
@@ -241,7 +235,7 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
     pub(crate) async fn soft_delete_ciphers(
         &self,
         user_id: &str,
-        vault: &JsonObject,
+        vault: &ReadVault,
         request: &LocalRequest,
     ) -> Outcome {
         let ids = strings(&request.json_body()?, "ids");
@@ -252,7 +246,7 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
     pub(crate) async fn restore_cipher(
         &self,
         user_id: &str,
-        vault: &JsonObject,
+        vault: &ReadVault,
         cipher_id: &str,
     ) -> Outcome {
         if item(vault, CIPHERS, cipher_id).is_none() {
@@ -267,7 +261,7 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
     pub(crate) async fn restore_ciphers(
         &self,
         user_id: &str,
-        vault: &JsonObject,
+        vault: &ReadVault,
         request: &LocalRequest,
     ) -> Outcome {
         let ids = strings(&request.json_body()?, "ids");
@@ -279,7 +273,7 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
     pub(crate) async fn archive_cipher(
         &self,
         user_id: &str,
-        vault: &JsonObject,
+        vault: &ReadVault,
         cipher_id: &str,
         archived: bool,
     ) -> Outcome {
@@ -295,7 +289,7 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
     pub(crate) async fn archive_ciphers(
         &self,
         user_id: &str,
-        vault: &JsonObject,
+        vault: &ReadVault,
         request: &LocalRequest,
         archived: bool,
     ) -> Outcome {
@@ -308,7 +302,7 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
     pub(crate) async fn import_ciphers(
         &self,
         user_id: &str,
-        vault: &JsonObject,
+        vault: &ReadVault,
         request: &LocalRequest,
     ) -> Outcome {
         let body = request.json_body()?;
@@ -364,15 +358,18 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
         let all_ciphers = [items(vault, CIPHERS), new_ciphers].concat();
         let updated = with_items(vault, FOLDERS, all_folders);
         let updated = with_items(&updated, CIPHERS, all_ciphers);
-        self.save(user_id, &updated).await?;
+        self.save(user_id, vault, &updated).await?;
         Ok(ok_empty_response())
     }
 
-    /// Removes every item and folder from the vault, along with the attachments.
+    /// Removes every item and folder from the vault, along with the attachments, as
+    /// [`Self::delete_cipher`] does. Only those that the vault has here are removed: an item that
+    /// another device added, and whose file has not come yet, stays, and so does the content of
+    /// its attachments.
     pub(crate) async fn purge(
         &self,
         user_id: &str,
-        vault: &JsonObject,
+        vault: &ReadVault,
         request: &LocalRequest,
     ) -> Outcome {
         let body = request.json_body()?;
@@ -380,9 +377,7 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
             return Ok(bad_request(INVALID_PASSWORD_MESSAGE));
         }
         let empty = with_items(&with_items(vault, CIPHERS, Vec::new()), FOLDERS, Vec::new());
-        self.save(user_id, &empty).await?;
-        let deletion = self.store.delete_all_attachments(user_id).await;
-        self.report_files_left_behind(deletion);
+        self.save(user_id, vault, &empty).await?;
         Ok(ok_empty_response())
     }
 
@@ -392,7 +387,7 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
     pub(crate) async fn create_attachment(
         &self,
         user_id: &str,
-        vault: &JsonObject,
+        vault: &ReadVault,
         cipher_id: &str,
         request: &LocalRequest,
     ) -> Outcome {
@@ -426,22 +421,22 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
             ],
         );
         let updated = with_item(vault, CIPHERS, &updated_cipher);
-        self.save(user_id, &updated).await?;
+        self.save(user_id, vault, &updated).await?;
         let id = id_of(&cipher, cipher_id);
         let response = upload_response(user_id, &id, updated_cipher, &attachment_id);
         Ok(response)
     }
 
-    /// Removes an attachment from an item, and then its encrypted content.
+    /// Removes an attachment from an item. Its encrypted content is deleted later, once nothing
+    /// can bring the attachment back (see `LocalVaultStore::tidy`).
     pub(crate) async fn delete_attachment(
         &self,
         user_id: &str,
-        vault: &JsonObject,
+        vault: &ReadVault,
         cipher_id: &str,
         attachment_id: &str,
     ) -> Outcome {
-        let Some((cipher, attachment)) = cipher_and_attachment(vault, cipher_id, attachment_id)
-        else {
+        let Some((cipher, _)) = cipher_and_attachment(vault, cipher_id, attachment_id) else {
             return Ok(not_found_response());
         };
         let attachments: Vec<JsonObject> = objects(&cipher, "attachments")
@@ -453,14 +448,7 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
         // response finds the same one.
         let updated_cipher = with_fields(&cipher, [("attachments", array_or_null(attachments))]);
         let updated = with_item(vault, CIPHERS, &updated_cipher);
-        self.save(user_id, &updated).await?;
-        let id = id_of(&cipher, cipher_id);
-        let attachment_id = id_of(&attachment, attachment_id);
-        let deletion = self
-            .store
-            .delete_attachment(user_id, &id, &attachment_id)
-            .await;
-        self.report_files_left_behind(deletion);
+        self.save(user_id, vault, &updated).await?;
         Ok(ok_response(&json!({"cipher": updated_cipher})))
     }
 
@@ -479,16 +467,10 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
                 if request.query.contains_key("comp") {
                     return Ok(bad_request(UPLOAD_IN_BLOCKS_MESSAGE));
                 }
-                let Some(vault) = self.store.read_vault(user_id).await? else {
+                let ids = self.listed_attachment(user_id, cipher_id, attachment_id);
+                let Some((id, attachment_id)) = ids.await? else {
                     return Ok(not_found_response());
                 };
-                let Some((cipher, attachment)) =
-                    cipher_and_attachment(&vault, cipher_id, attachment_id)
-                else {
-                    return Ok(not_found_response());
-                };
-                let id = id_of(&cipher, cipher_id);
-                let attachment_id = id_of(&attachment, attachment_id);
                 let Some(path) = self.store.attachment_path(user_id, &id, &attachment_id) else {
                     return Err(IoError::new("Invalid attachment path").into());
                 };
@@ -497,7 +479,13 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
                 Ok(response)
             }
             "GET" => {
-                let attachment = self.store.attachment(user_id, cipher_id, attachment_id);
+                // The content of an attachment that was removed is kept for a while, as a change
+                // of another device can bring the attachment back, but it is not handed out.
+                let ids = self.listed_attachment(user_id, cipher_id, attachment_id);
+                let Some((id, attachment_id)) = ids.await? else {
+                    return Ok(not_found_response());
+                };
+                let attachment = self.store.attachment(user_id, &id, &attachment_id);
                 match attachment.await? {
                     Some(path) => Ok(file_response(path)),
                     None => Ok(not_found_response()),
@@ -507,17 +495,34 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
         }
     }
 
+    /// Returns the IDs that the vault of the account has an attachment of an item under, or
+    /// `None` if it does not have the attachment.
+    async fn listed_attachment(
+        &self,
+        user_id: &str,
+        cipher_id: &str,
+        attachment_id: &str,
+    ) -> Result<Option<(String, String)>, IoError> {
+        let Some(vault) = self.read_vault(user_id).await? else {
+            return Ok(None);
+        };
+        let found = cipher_and_attachment(&vault, cipher_id, attachment_id);
+        Ok(found.map(|(cipher, attachment)| {
+            (id_of(&cipher, cipher_id), id_of(&attachment, attachment_id))
+        }))
+    }
+
     /// Adds a folder to the vault.
     pub(crate) async fn create_folder(
         &self,
         user_id: &str,
-        vault: &JsonObject,
+        vault: &ReadVault,
         request: &LocalRequest,
     ) -> Outcome {
         let body = request.json_body()?;
         let folder = folder_json(&self.new_id(), element(&body, "name"), &self.now());
         let updated = with_item(vault, FOLDERS, &folder);
-        self.save(user_id, &updated).await?;
+        self.save(user_id, vault, &updated).await?;
         Ok(ok_response(&Value::Object(folder)))
     }
 
@@ -525,7 +530,7 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
     pub(crate) async fn update_folder(
         &self,
         user_id: &str,
-        vault: &JsonObject,
+        vault: &ReadVault,
         folder_id: &str,
         request: &LocalRequest,
     ) -> Outcome {
@@ -536,7 +541,7 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
         let id = id_of(&existing, folder_id);
         let folder = folder_json(&id, element(&body, "name"), &self.now());
         let updated = with_item(vault, FOLDERS, &folder);
-        self.save(user_id, &updated).await?;
+        self.save(user_id, vault, &updated).await?;
         Ok(ok_response(&Value::Object(folder)))
     }
 
@@ -544,14 +549,15 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
     pub(crate) async fn delete_folder(
         &self,
         user_id: &str,
-        vault: &JsonObject,
+        vault: &ReadVault,
         folder_id: &str,
     ) -> Outcome {
         let Some(folder) = item(vault, FOLDERS, folder_id) else {
             return Ok(not_found_response());
         };
         let ids = [id_of(&folder, folder_id)];
-        self.save(user_id, &without_folders(vault, &ids)).await?;
+        let updated = without_folders(vault, &ids);
+        self.save(user_id, vault, &updated).await?;
         Ok(ok_empty_response())
     }
 
@@ -559,48 +565,50 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
     pub(crate) async fn delete_folders(
         &self,
         user_id: &str,
-        vault: &JsonObject,
+        vault: &ReadVault,
         request: &LocalRequest,
     ) -> Outcome {
         let ids = existing_ids(vault, FOLDERS, &strings(&request.json_body()?, "ids"));
-        self.save(user_id, &without_folders(vault, &ids)).await?;
+        let updated = without_folders(vault, &ids);
+        self.save(user_id, vault, &updated).await?;
         Ok(ok_empty_response())
     }
 
     /// Removes every folder from the vault. The items in them are kept, without a folder.
-    pub(crate) async fn delete_all_folders(&self, user_id: &str, vault: &JsonObject) -> Outcome {
+    pub(crate) async fn delete_all_folders(&self, user_id: &str, vault: &ReadVault) -> Outcome {
         let ids: Vec<String> = items(vault, FOLDERS)
             .iter()
             .filter_map(|folder| string(folder, "id").map(str::to_owned))
             .collect();
-        self.save(user_id, &without_folders(vault, &ids)).await?;
+        let updated = without_folders(vault, &ids);
+        self.save(user_id, vault, &updated).await?;
         Ok(ok_empty_response())
     }
 
-    async fn add_cipher(&self, user_id: &str, vault: &JsonObject, body: &JsonObject) -> Outcome {
+    async fn add_cipher(&self, user_id: &str, vault: &ReadVault, body: &JsonObject) -> Outcome {
         if let Some(refusal) = refusal(body, user_id, vault) {
             return Ok(refusal);
         }
         let cipher = to_cipher(body, &self.new_id(), None, &self.now());
         let updated = with_item(vault, CIPHERS, &cipher);
-        self.save(user_id, &updated).await?;
+        self.save(user_id, vault, &updated).await?;
         Ok(ok_response(&Value::Object(cipher)))
     }
 
-    async fn soft_delete(&self, user_id: &str, vault: &JsonObject, ids: &[String]) -> Outcome {
+    async fn soft_delete(&self, user_id: &str, vault: &ReadVault, ids: &[String]) -> Outcome {
         let deleted_date = Value::String(self.now());
         // The client is not sent the items, so it keeps the revision dates that it knows them by.
         let updated = with_each_item(vault, CIPHERS, ids, |cipher| {
             with_fields(cipher, [("deletedDate", deleted_date.clone())])
         });
-        self.save(user_id, &updated).await?;
+        self.save(user_id, vault, &updated).await?;
         Ok(ok_empty_response())
     }
 
     async fn restore(
         &self,
         user_id: &str,
-        vault: &JsonObject,
+        vault: &ReadVault,
         ids: &[String],
     ) -> Result<Vec<JsonObject>, IoError> {
         let date = Value::String(self.now());
@@ -610,14 +618,14 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
                 [("deletedDate", Value::Null), ("revisionDate", date.clone())],
             )
         });
-        self.save(user_id, &updated).await?;
+        self.save(user_id, vault, &updated).await?;
         Ok(items_with_ids(&updated, CIPHERS, ids))
     }
 
     async fn archive(
         &self,
         user_id: &str,
-        vault: &JsonObject,
+        vault: &ReadVault,
         ids: &[String],
         archived: bool,
     ) -> Result<Vec<JsonObject>, IoError> {
@@ -632,19 +640,8 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
                 ],
             )
         });
-        self.save(user_id, &updated).await?;
+        self.save(user_id, vault, &updated).await?;
         Ok(items_with_ids(&updated, CIPHERS, ids))
-    }
-
-    /// Reports files of attachments that the vault, which is saved by now, no longer has, and
-    /// that could not be deleted. The request has done what it is for, so it does not fail over
-    /// them: the client would be told that nothing was deleted, and find the item gone at its
-    /// next sync.
-    fn report_files_left_behind(&self, deletion: Result<bool, IoError>) {
-        if !matches!(deletion, Ok(true)) {
-            let platform = &self.platform;
-            platform.log(LogLevel::Warning, FILES_LEFT_BEHIND_MESSAGE);
-        }
     }
 }
 
@@ -916,17 +913,13 @@ fn without_items(vault: &JsonObject, key: &str, ids: &[String]) -> JsonObject {
     with_items(vault, key, list.collect())
 }
 
-/// Returns the vault without the folders, and with the items that were in them in none.
+/// Returns the vault without the folders. The items that were in them are in no folder from then
+/// on, as the vault is put together with the items of a deleted folder in none (see
+/// `merge::without_deleted_folders`). They are not changed for it: as new versions of the items,
+/// the deletion would win over a change of one of them that another device made before the
+/// deletion came to it, and the change would be lost.
 fn without_folders(vault: &JsonObject, folder_ids: &[String]) -> JsonObject {
-    let is_removed = |folder_id: &str| folder_ids.iter().any(|id| eq_ignore_case(id, folder_id));
-    let mut ciphers = items(vault, CIPHERS);
-    for cipher in &mut ciphers {
-        if string(cipher, "folderId").is_some_and(is_removed) {
-            cipher.insert("folderId".to_owned(), Value::Null);
-        }
-    }
-    let vault = without_items(vault, FOLDERS, folder_ids);
-    with_items(&vault, CIPHERS, ciphers)
+    without_items(vault, FOLDERS, folder_ids)
 }
 
 /// Returns the size of a file the way the server describes it, such as `2.00 KB`. The fraction is

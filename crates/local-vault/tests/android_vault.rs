@@ -99,12 +99,25 @@ fn nothing_changes_but_what_a_request_is_about() {
     let updated = client.send("PUT", &path, &token, update);
 
     assert_eq!(updated.code, 200);
-    let written = read_json(&fs, &VAULT_FILE);
+    // The device that writes first takes the vault over, and the earlier layout is left with
+    // only the marker of this one, which the earlier clients leave alone.
+    let marker = json!({"format": "bitwarden-local-vault", "version": 2});
+    assert_eq!(read_json(&fs, &VAULT_FILE), marker);
+    let written = read_json(&fs, &device_file(USER_ID, DEVICE));
     assert_eq!(written["revisionDate"], "2026-10-11T12:00:00.000Z");
     let without_sync = |vault: &Value| {
         let mut vault = vault.clone();
-        vault["sync"] = Value::Null;
-        vault["revisionDate"] = Value::Null;
+        for key in [
+            "sync",
+            "revisionDate",
+            "version",
+            "since",
+            "records",
+            "tombstones",
+            "removedAttachments",
+        ] {
+            vault[key] = Value::Null;
+        }
         vault
     };
     assert_eq!(without_sync(&written), without_sync(&fixture));
@@ -120,8 +133,9 @@ fn nothing_changes_but_what_a_request_is_about() {
     renamed["favorite"] = json!(true);
     renamed["revisionDate"] = json!("2026-10-11T12:00:00.000Z");
     assert_eq!(written["sync"]["ciphers"][1], renamed);
-    let backup = read_json(&fs, &[USER_ID, "vault.json.bak"]);
-    assert_eq!(backup, fixture);
+    // The vault of the earlier layout is not kept as the backup of `vault.json`: it is in the
+    // file of the device.
+    assert_eq!(fs.get(&[USER_ID, "vault.json.bak"]), None);
 }
 
 #[test]
@@ -165,7 +179,7 @@ fn a_new_item_is_stored_with_the_fields_that_the_app_stores_an_item_with() {
     assert_eq!(created["object"], "cipherDetails");
     assert_eq!(created.get("lastKnownRevisionDate"), None);
     assert_eq!(created.get("encryptedFor"), None);
-    let ciphers = &read_json(&fs, &VAULT_FILE)["sync"]["ciphers"];
+    let ciphers = &read_json(&fs, &device_file(USER_ID, DEVICE))["sync"]["ciphers"];
     assert_eq!(ciphers.as_array().unwrap().len(), 3);
 }
 
@@ -199,7 +213,7 @@ fn the_encrypted_for_of_an_earlier_vault_is_kept_until_its_item_is_updated() {
 
     assert_eq!(sync, earlier["sync"]);
     assert_eq!(updated.code, 200);
-    let written = read_json(&fs, &VAULT_FILE);
+    let written = read_json(&fs, &device_file(USER_ID, DEVICE));
     let ciphers = &written["sync"]["ciphers"];
     assert_eq!(ciphers[0], earlier["sync"]["ciphers"][0]);
     let mut expected = fixture["sync"]["ciphers"][1].clone();

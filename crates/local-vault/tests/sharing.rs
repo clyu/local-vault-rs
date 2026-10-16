@@ -59,7 +59,7 @@ fn the_fields_of_a_vault_that_are_not_known_are_kept_as_they_are() {
     let numbers = r#""numbers": [1.0, 1e3, 9007199254740993, 0.10]"#;
     let content = vault.to_string();
     let content = format!("{}, {numbers}}}", &content[..content.len() - 1]);
-    let file = [user_id.as_str(), "vault.json"];
+    let file = device_file(&user_id, DEVICE);
     fs.put(&file, content);
 
     let folder = json!({"name": "2.folder"});
@@ -85,8 +85,8 @@ fn the_vault_is_read_from_its_backup_when_the_vault_file_is_not_complete() {
     let (token, user_id) = client.register_and_log_in();
     let folder = json!({"name": "2.folder"});
     client.send("POST", "folders", &token, folder);
-    let file = [user_id.as_str(), "vault.json"];
-    let backup = [user_id.as_str(), "vault.json.bak"];
+    let file = device_file(&user_id, DEVICE);
+    let backup = [user_id.as_str(), "devices", DEVICE, "vault.json.bak"];
     let complete = fs.get(&file).unwrap();
     assert!(read_json(&fs, &backup).is_object());
 
@@ -101,24 +101,49 @@ fn the_vault_is_read_from_its_backup_when_the_vault_file_is_not_complete() {
 fn a_vault_of_a_version_that_is_not_known_is_left_alone() {
     let (client, fs) = browser();
     let (token, user_id) = client.register_and_log_in();
+    let login = body(&client.log_in(EMAIL, PASSWORD_HASH));
+    let refresh_token = login["refresh_token"].as_str().unwrap().to_owned();
     let folder = json!({"name": "2.folder"});
     client.send("POST", "folders", &token, folder);
     let mut newer = vault_file(&fs, &user_id);
-    newer["version"] = json!(2);
+    newer["version"] = json!(3);
     let content = newer.to_string();
-    let file = [user_id.as_str(), "vault.json"];
+    let file = device_file(&user_id, DEVICE);
     fs.put(&file, content.clone());
 
-    let sync = client.get("sync", &token);
-    let login = client.log_in(EMAIL, PASSWORD_HASH);
+    let sync = client.request("GET", "sync").token(&token).try_send();
     let other = json!({"name": "2.other"});
-    let created = client.send("POST", "folders", &token, other);
+    let created = client.request("POST", "folders").token(&token).json(other);
+    let refresh = [
+        ("grant_type", "refresh_token"),
+        ("refresh_token", refresh_token.as_str()),
+    ];
+    let refreshed = client.request("POST", "connect/token").form(&refresh);
+    let password = [
+        ("grant_type", "password"),
+        ("username", EMAIL),
+        ("password", PASSWORD_HASH),
+    ];
+    let logged_in = client.request("POST", "connect/token").form(&password);
+    let email = json!({"email": EMAIL});
+    let prelogin = client.request("POST", "accounts/prelogin").json(email);
+    let registration = registration(EMAIL, PASSWORD_HASH);
+    let register = client.request("POST", "accounts/register/finish");
+    let registered = register.json(registration).try_send();
 
-    // The backup holds a vault of a version that is known, but an older one.
-    assert_eq!(sync.code, 401);
-    assert_eq!(login.code, 400);
-    assert_eq!(created.code, 401);
+    // A newer client wrote it, so the account is not taken to be gone: told so, the client would
+    // log it out, derive the master key the default way, take the master password to be wrong,
+    // or register the email again. Each fails as a request that did not reach the server until
+    // the client is updated. The backup, which holds a vault of a version that is known but an
+    // older one, is not read in its place.
+    assert!(sync.is_err());
+    assert!(created.try_send().is_err());
+    assert!(refreshed.try_send().is_err());
+    assert!(logged_in.try_send().is_err());
+    assert!(prelogin.try_send().is_err());
+    assert!(registered.is_err());
     assert_eq!(fs.get(&file).unwrap(), content.as_bytes());
+    assert!(fs.paths().iter().all(|path| path[0] == user_id));
 }
 
 #[test]
@@ -126,7 +151,7 @@ fn a_vault_that_another_client_wrote_with_a_byte_order_mark_is_read() {
     let (client, fs) = browser();
     let (token, user_id) = client.register_and_log_in();
     let content = vault_file(&fs, &user_id).to_string();
-    let file = [user_id.as_str(), "vault.json"];
+    let file = device_file(&user_id, DEVICE);
     fs.put(&file, format!("\u{feff}{content}"));
 
     let sync = client.get("sync", &token);
@@ -140,10 +165,12 @@ fn a_number_that_is_written_as_a_string_is_not_a_version() {
     let (client, fs) = browser();
     let (token, user_id) = client.register_and_log_in();
     let mut vault = vault_file(&fs, &user_id);
-    vault["version"] = json!("1");
+    vault["version"] = json!("2");
     replace_vault_file(&fs, &user_id, &vault);
 
-    assert_eq!(client.get("sync", &token).code, 401);
+    // The vault is not used, and not taken to be gone either.
+    let sync = client.request("GET", "sync").token(&token);
+    assert!(sync.try_send().is_err());
 }
 
 #[test]

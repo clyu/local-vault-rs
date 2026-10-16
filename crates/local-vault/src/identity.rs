@@ -15,7 +15,7 @@ use crate::json::{
 };
 use crate::platform::Platform;
 use crate::server::{LocalServer, Outcome};
-use crate::store::{LOCAL_VAULT_FORMAT, LOCAL_VAULT_VERSION};
+use crate::store::{LOCAL_VAULT_FORMAT, LOCAL_VAULT_VERSION, ReadVault};
 use crate::token::{
     AccessTokenClaims, create_access_token, create_refresh_token, user_id_of_refresh_token,
 };
@@ -66,7 +66,7 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
         if email.is_empty() {
             return Ok(bad_request(EMAIL_REQUIRED_MESSAGE));
         }
-        if self.store.find_account_id(&email).await?.is_some() {
+        if !self.find_accounts(&email).await?.is_empty() {
             return Ok(email_taken(&email));
         }
         let token = json!({"email": email, "name": string(&body, "name")});
@@ -81,7 +81,7 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
             return Ok(bad_request(INCOMPLETE_REGISTRATION_MESSAGE));
         };
         let email = registration.email.as_str();
-        if self.store.find_account_id(email).await?.is_some() {
+        if !self.find_accounts(email).await?.is_empty() {
             return Ok(email_taken(email));
         }
         let user_id = self.new_id();
@@ -147,14 +147,17 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
             "account": {"masterPasswordVerifier": verifier},
             "sync": sync,
         });
-        self.store
-            .write_vault(&user_id, &into_object(vault))
-            .await?;
+        // A new account has none of its files yet.
+        let read = ReadVault::default();
+        self.save(&user_id, &read, &into_object(vault)).await?;
         Ok(ok_response(&json!({"object": "register"})))
     }
 
     /// Returns how the master key of the account with the email is derived. An email that no
-    /// account has gets the defaults, so that this does not tell which emails have an account.
+    /// account has gets the defaults, so that this does not tell which emails have an account,
+    /// unless the vault of an account is still on its way, or has a layout that is not known,
+    /// which may be the one with the email: the request then fails as one that did not reach the
+    /// server.
     ///
     /// There is no master password yet to tell several accounts with the email apart by, so the
     /// answer is about the first of them. Another one can only be signed in to if its master key
@@ -209,16 +212,10 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
         let password_hash = request.form_field("password").unwrap_or_default();
         // A vault folder can hold more than one account with an email, which only their master
         // passwords tell apart.
-        let mut account = None;
-        for account_id in self.store.find_account_ids(email).await? {
-            let vault = self.store.read_vault(&account_id).await?;
-            if let Some(vault) = vault
-                && matches_verifier(password_verifier(&vault), password_hash)
-            {
-                account = Some((account_id, vault));
-                break;
-            }
-        }
+        let accounts = self.find_accounts(email).await?;
+        let account = accounts
+            .into_iter()
+            .find(|(_, vault)| matches_verifier(password_verifier(vault), password_hash));
         let Some((user_id, vault)) = account else {
             return Ok(invalid_grant(WRONG_PASSWORD_MESSAGE));
         };
@@ -254,7 +251,7 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
         let Some(user_id) = user_id_of_refresh_token(refresh_token) else {
             return Ok(unknown_refresh_token());
         };
-        let Some(vault) = self.store.read_vault(user_id).await? else {
+        let Some(vault) = self.read_account(user_id).await? else {
             return Ok(unknown_refresh_token());
         };
         let tokens = self.tokens(user_id, &profile(&vault), request);

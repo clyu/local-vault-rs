@@ -129,16 +129,21 @@ pub struct WasmLocalServer {
 #[wasm_bindgen(js_class = LocalServer)]
 impl WasmLocalServer {
     /// A local server on the vault folder that the file system reaches, for the client, which
-    /// is `"browser"` or `"android"`.
+    /// is `"browser"` or `"android"`, on the device with the ID: that of this installation of
+    /// the client, such as a UUID that it keeps, which is the same every time. The client writes
+    /// its changes to a directory of the vault folder named after it, which no other device
+    /// writes. Throws if the ID cannot be the name of a directory.
     #[wasm_bindgen(constructor)]
     pub fn new(
         file_system: JsFileSystem,
         platform: JsPlatform,
         #[wasm_bindgen(unchecked_param_type = "\"browser\" | \"android\"")] client: &str,
+        device_id: &str,
     ) -> Result<WasmLocalServer, JsError> {
         let client = client_kind(client)?;
         let file_system = HostFileSystem(file_system);
-        let server = LocalServer::new(file_system, HostPlatform(platform), client);
+        let server = LocalServer::new(file_system, HostPlatform(platform), client, device_id)
+            .map_err(|error| JsError::new(error.message()))?;
         Ok(Self {
             server: Rc::new(server),
         })

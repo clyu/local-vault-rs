@@ -10,7 +10,6 @@ pub(crate) const HTTP_BAD_REQUEST: u16 = 400;
 pub(crate) const HTTP_UNAUTHORIZED: u16 = 401;
 pub(crate) const HTTP_NOT_FOUND: u16 = 404;
 pub(crate) const HTTP_TOO_MANY_REQUESTS: u16 = 429;
-pub(crate) const HTTP_INTERNAL_ERROR: u16 = 500;
 
 /// The body of the response that a client gives when its call of the local server fails in a
 /// way that the local server does not answer, in the shape that the Bitwarden API reports errors
