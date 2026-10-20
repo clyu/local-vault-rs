@@ -24,6 +24,7 @@ mod fs;
 mod http;
 mod identity;
 mod json;
+mod kdf;
 mod memory_fs;
 mod merge;
 mod platform;

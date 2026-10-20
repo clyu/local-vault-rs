@@ -221,6 +221,39 @@ fn the_encrypted_for_of_an_earlier_vault_is_kept_until_its_item_is_updated() {
     assert_eq!(ciphers[1], expected);
 }
 
+#[test]
+fn kdf_settings_that_would_be_refused_now_still_log_in_and_change_the_master_password() {
+    // The earlier implementations took any settings.
+    let mut earlier = fixture();
+    let kdf = json!({"kdfType": 0, "iterations": 5000, "memory": null, "parallelism": null});
+    earlier["sync"]["userDecryption"]["masterPasswordUnlock"]["kdf"] = kdf.clone();
+    let (client, _) = client_with(&earlier.to_string());
+    let email = json!({"email": ANDROID_EMAIL});
+    let new_hash = "bmV3LWhhc2g=";
+    let change = json!({
+        "masterPasswordHash": ANDROID_HASH,
+        "authenticationData": {
+            "salt": ANDROID_EMAIL,
+            "kdf": kdf,
+            "masterPasswordAuthenticationHash": new_hash,
+        },
+        "unlockData": {
+            "salt": ANDROID_EMAIL,
+            "kdf": kdf,
+            "masterKeyWrappedUserKey": "2.newUserKey",
+        },
+    });
+
+    let prelogin = client.send_anonymous("POST", "accounts/prelogin", email);
+    let token = log_in(&client);
+    let changed = client.send("POST", "accounts/password", &token, change);
+
+    assert_eq!(body(&prelogin)["kdfSettings"], kdf);
+    assert_eq!(changed.code, 200);
+    let login = body(&client.log_in(ANDROID_EMAIL, new_hash));
+    assert_eq!(login["KdfIterations"], 5000);
+}
+
 /// What kind of value a JSON value is.
 fn kind(value: &Value) -> &'static str {
     match value {

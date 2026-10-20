@@ -11,6 +11,7 @@ use crate::http::{
 use crate::json::{
     JsonObject, int, int_or_null, into_object, is_blank, obj, string, string_or_null, with_fields,
 };
+use crate::kdf::{is_same_kdf, kdf_error};
 use crate::platform::{LogLevel, Platform};
 use crate::server::{ClientKind, LocalServer, Outcome};
 use crate::store::{KEY_ACCOUNT, KEY_SYNC, ReadVault};
@@ -24,6 +25,7 @@ const FILES_LEFT_BEHIND_MESSAGE: &str =
     "Files of an account that was deleted could not be deleted from the vault folder.";
 const ANOTHER_USER_KEY_MESSAGE: &str = "This is not the ID of the user key of the account.";
 const NO_HINT_MESSAGE: &str = "There is no master password hint for this email.";
+const KDF_CHANGED_MESSAGE: &str = "The KDF settings cannot be changed with the master password.";
 
 impl<F: FileSystem, P: Platform> LocalServer<F, P> {
     /// A server emails the hint, which cannot be done here. It is the message of an error
@@ -54,6 +56,9 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
 
     /// Replaces the master password. A new security stamp signs the account out wherever else
     /// the vault is in use, as the user key there is still unlocked with the old password.
+    ///
+    /// The new master key has to be derived with the settings that the account has. As with the
+    /// Bitwarden server, they only change with [`Self::update_kdf`], which checks them.
     pub(crate) async fn change_password(
         &self,
         user_id: &str,
@@ -67,6 +72,9 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
         let Some(updated) = self.with_master_password(vault, &body) else {
             return Ok(invalid_request_response());
         };
+        if !has_same_kdf(vault, &updated) {
+            return Ok(bad_request(KDF_CHANGED_MESSAGE));
+        }
         let hint = string(&body, "masterPasswordHint");
         let profile = with_fields(
             &profile(&updated),
@@ -80,7 +88,8 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
         Ok(ok_empty_response())
     }
 
-    /// Replaces the parameters that the master key is derived with.
+    /// Replaces the parameters that the master key is derived with, unless a master key may not
+    /// be derived with the new ones (see [`kdf_error`]).
     pub(crate) async fn update_kdf(
         &self,
         user_id: &str,
@@ -94,6 +103,9 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
         let Some(updated) = self.with_master_password(vault, &body) else {
             return Ok(invalid_request_response());
         };
+        if let Some(message) = kdf_of(&updated).and_then(kdf_error) {
+            return Ok(bad_request(&message));
+        }
         self.save(user_id, vault, &updated).await?;
         Ok(ok_empty_response())
     }
@@ -220,6 +232,19 @@ pub(crate) fn with_profile(vault: &JsonObject, profile: JsonObject) -> JsonObjec
 /// the master key is derived with, and the user key encrypted with that master key.
 pub(crate) fn master_password_unlock(vault: &JsonObject) -> Option<&JsonObject> {
     obj(user_decryption(vault)?, "masterPasswordUnlock")
+}
+
+/// The settings that the master key of the vault is derived with.
+fn kdf_of(vault: &JsonObject) -> Option<&JsonObject> {
+    obj(master_password_unlock(vault)?, "kdf")
+}
+
+/// Returns `true` if the master keys of both vaults are derived with the same settings.
+fn has_same_kdf(vault: &JsonObject, other: &JsonObject) -> bool {
+    match (kdf_of(vault), kdf_of(other)) {
+        (Some(kdf), Some(other_kdf)) => is_same_kdf(kdf, other_kdf),
+        _ => false,
+    }
 }
 
 /// What the vault has about how its user key is unlocked.

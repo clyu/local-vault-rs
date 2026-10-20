@@ -13,6 +13,7 @@ use crate::json::{
     JsonObject, base64_url_decode, base64_url_encode, int, int_or_null, into_object, is_blank,
     normalize_email, obj, string,
 };
+use crate::kdf::{KDF_TYPE_PBKDF2, kdf_error};
 use crate::platform::Platform;
 use crate::server::{LocalServer, Outcome};
 use crate::store::{LOCAL_VAULT_FORMAT, LOCAL_VAULT_VERSION, ReadVault};
@@ -23,7 +24,6 @@ use crate::verifier::{create_verifier, matches_verifier};
 
 const TOKEN_LIFETIME_SECONDS: i64 = 5 * 365 * 24 * 60 * 60;
 const DEFAULT_KDF_ITERATIONS: i64 = 600_000;
-const KDF_TYPE_PBKDF2: i64 = 0;
 
 const EMAIL_REQUIRED_MESSAGE: &str = "An email is required.";
 const INCOMPLETE_REGISTRATION_MESSAGE: &str = "The registration is not complete.";
@@ -74,12 +74,17 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
         Ok(ok_response(&Value::String(token)))
     }
 
-    /// Creates the vault of a new account from the keys that the client generated for it.
+    /// Creates the vault of a new account from the keys that the client generated for it. One
+    /// whose master key may not be derived with the settings that it comes with is not created
+    /// (see [`kdf_error`]).
     pub(crate) async fn register_finish(&self, request: &LocalRequest) -> Outcome {
         let body = request.json_body()?;
         let Some(registration) = Registration::read(&body) else {
             return Ok(bad_request(INCOMPLETE_REGISTRATION_MESSAGE));
         };
+        if let Some(message) = obj(&registration.unlock, "kdf").and_then(kdf_error) {
+            return Ok(bad_request(&message));
+        }
         let email = registration.email.as_str();
         if !self.find_accounts(email).await?.is_empty() {
             return Ok(email_taken(email));

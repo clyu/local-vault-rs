@@ -6,7 +6,7 @@ mod common;
 
 use common::*;
 use local_vault::{ClientKind, MemoryFileSystem};
-use serde_json::json;
+use serde_json::{Value, json};
 
 const REGISTER: &str = "accounts/register/finish";
 const OTHER_HASH: &str = "b3RoZXItaGFzaA==";
@@ -17,6 +17,21 @@ const OTHER_KEY_ID: &str = "b16642850e9a7bd0fe6658f98e8dfdf1";
 
 fn browser() -> (Client<MemoryFileSystem>, MemoryFileSystem) {
     Client::in_memory(ClientKind::Browser)
+}
+
+/// The body of a request that gives the account of [`EMAIL`] a new master key, derived with the
+/// settings: it proves the master password with [`PASSWORD_HASH`], and the master password is
+/// known by [`NEW_HASH`] after it.
+fn new_master_key(kdf: &Value) -> Value {
+    json!({
+        "masterPasswordHash": PASSWORD_HASH,
+        "authenticationData": {
+            "salt": EMAIL,
+            "kdf": kdf,
+            "masterPasswordAuthenticationHash": NEW_HASH,
+        },
+        "unlockData": {"salt": EMAIL, "kdf": kdf, "masterKeyWrappedUserKey": "2.newUserKey"},
+    })
 }
 
 #[test]
@@ -102,6 +117,22 @@ fn an_account_is_not_registered_without_its_keys() {
 
     assert_eq!(response.code, 400);
     assert_eq!(message(&response), "The registration is not complete.");
+    assert!(fs.paths().is_empty());
+}
+
+#[test]
+fn an_account_is_not_registered_with_kdf_settings_that_the_bitwarden_server_refuses() {
+    let (client, fs) = browser();
+    let kdf = json!({"kdfType": 1, "iterations": 3, "memory": 14, "parallelism": 4});
+    let mut registration = registration(EMAIL, PASSWORD_HASH);
+    registration["masterPasswordAuthentication"]["kdf"] = kdf.clone();
+    registration["masterPasswordUnlock"]["kdf"] = kdf;
+
+    let response = client.send_anonymous("POST", REGISTER, registration);
+
+    assert_eq!(response.code, 400);
+    let refused = "Argon2 memory must be between 15mb and 1024mb.";
+    assert_eq!(message(&response), refused);
     assert!(fs.paths().is_empty());
 }
 
@@ -275,22 +306,30 @@ fn changing_the_master_password_replaces_what_the_account_logs_in_with() {
 }
 
 #[test]
+fn the_master_password_is_not_changed_with_other_kdf_settings() {
+    let (client, fs) = browser();
+    let (token, user_id) = client.register_and_log_in();
+    let vault = vault_file(&fs, &user_id);
+    // Settings that a change of the settings takes.
+    let kdf = json!({"kdfType": 1, "iterations": 3, "memory": 64, "parallelism": 4});
+
+    let response = client.send("POST", "accounts/password", &token, new_master_key(&kdf));
+
+    assert_eq!(response.code, 400);
+    let refused = "The KDF settings cannot be changed with the master password.";
+    assert_eq!(message(&response), refused);
+    assert_eq!(vault_file(&fs, &user_id), vault);
+    assert_eq!(client.log_in(EMAIL, PASSWORD_HASH).code, 200);
+}
+
+#[test]
 fn changing_the_kdf_replaces_what_the_master_key_is_derived_with() {
     let (client, fs) = browser();
     let (token, user_id) = client.register_and_log_in();
     let stamp = vault_file(&fs, &user_id)["sync"]["profile"]["securityStamp"].clone();
     let kdf = json!({"kdfType": 1, "iterations": 3, "memory": 64, "parallelism": 4});
-    let change = json!({
-        "masterPasswordHash": PASSWORD_HASH,
-        "authenticationData": {
-            "salt": EMAIL,
-            "kdf": kdf,
-            "masterPasswordAuthenticationHash": NEW_HASH,
-        },
-        "unlockData": {"salt": EMAIL, "kdf": kdf, "masterKeyWrappedUserKey": "2.newUserKey"},
-    });
 
-    let response = client.send("POST", "accounts/kdf", &token, change);
+    let response = client.send("POST", "accounts/kdf", &token, new_master_key(&kdf));
 
     assert_eq!(response.code, 200);
     let login = body(&client.log_in(EMAIL, NEW_HASH));
@@ -301,6 +340,27 @@ fn changing_the_kdf_replaces_what_the_master_key_is_derived_with() {
     let sync = &vault_file(&fs, &user_id)["sync"];
     assert_eq!(sync["userDecryption"]["masterPasswordUnlock"]["kdf"], kdf);
     assert_eq!(sync["profile"]["securityStamp"], stamp);
+}
+
+#[test]
+fn the_kdf_is_not_changed_to_settings_that_the_bitwarden_server_refuses() {
+    let (client, fs) = browser();
+    let (token, user_id) = client.register_and_log_in();
+    let vault = vault_file(&fs, &user_id);
+    let weak = new_master_key(&json!({"kdfType": 0, "iterations": 100_000}));
+    let other_kdf = new_master_key(&json!({"kdfType": 2, "iterations": 600_000}));
+
+    let weak = client.send("POST", "accounts/kdf", &token, weak);
+    let other_kdf = client.send("POST", "accounts/kdf", &token, other_kdf);
+
+    assert_eq!(weak.code, 400);
+    let too_few = "KDF iterations must be between 600000 and 2000000.";
+    assert_eq!(message(&weak), too_few);
+    assert_eq!(other_kdf.code, 400);
+    let unknown = "KDF type must be 0 (PBKDF2-SHA256) or 1 (Argon2id).";
+    assert_eq!(message(&other_kdf), unknown);
+    assert_eq!(vault_file(&fs, &user_id), vault);
+    assert_eq!(client.log_in(EMAIL, PASSWORD_HASH).code, 200);
 }
 
 #[test]

@@ -298,6 +298,7 @@ a newer one of the device that wrote it.
 |-------------------|----------------------|
 | Verify the email address at registration | No email is sent. The request that would send it returns the verification token right away, as a server with email verification turned off does. |
 | Create the account | The file of the device is created from the keys that the client generated, under a new UUID as the account ID. |
+| Refuse KDF settings that it does not take | A registration and a change of the KDF settings are refused if the settings are outside of the ranges that the Bitwarden server takes them in: PBKDF2-SHA256 with 600 000 to 2 000 000 iterations, or Argon2id with 2 to 10 iterations, 15 to 1024 MiB of memory and a parallelism of 1 to 16. So are the settings of another KDF, which the server does not check. A change of the master password is refused if it comes with other settings than the account has, as with the server: only a change of the settings changes them. Settings that an account already has are not checked again, so an account that an earlier version took other settings for still logs in and changes its master password. |
 | Tell the client how to derive the master key | The KDF settings are read from the vault of the account with that email address, which is the one with the lowest ID if there are several. An unknown address gets the defaults, unless the vault of an account is still on its way to the device, or has a layout that is not known, as the address may be its: the request then fails as one that did not reach the server. |
 | Check the master password | The client sends the same password hash it sends to a server. It is checked against a salted verifier in the vault, which is the counterpart of the hash a server stores. |
 | Find the account that logs in | The account directories are searched for the ones with that email address. They are gone through in the order of their IDs, and the first one that the master password is right for is logged in to. Nothing is registered per device, so a device that is given a vault folder can log in to the accounts in it. |
@@ -371,6 +372,12 @@ another device.
 **Changing the master password.** The change replaces the verifier and the encrypted user key,
 and gives the account a new security stamp. Every other client sees the new stamp at its next
 sync and logs the account out, as its copy of the user key is unlocked with the old password.
+A client derives the new master key with the KDF settings that the account has, and not with
+the ones that it was unlocked with, which are the settings from before once it changed them
+itself, or synced a change of them from another device (see below). The vault takes a new master
+password only with the settings of the account, but cannot tell whether the user key is encrypted
+with a master key that they derive: an account whose user key is encrypted with another one can
+never be unlocked again.
 
 **Changing the KDF settings.** The change replaces the verifier and the encrypted user key as
 well, with those of the master key that the new settings derive, but keeps the user key and the
@@ -430,7 +437,13 @@ file system and the setting for the vault folder. A workable order:
    has (see [Moving the vault to another folder](#moving-the-vault-to-another-folder)). It calls
    them rather than holding a copy of them, and does only the copying, as a stream.
 8. **Test with two clients on one folder**: register on one and log in on the other, change an
-   item on both, and change the master password on one to see the other log out.
+   item on both, and change the master password on one to see the other log out. Then change the
+   KDF settings on one and the master password on the other, without locking the other in
+   between, and the settings and then the master password on one client, without locking it
+   either: each time, the new master password has to log in and unlock on both clients. A client
+   that derives the new master key with the settings that it was unlocked with then leaves an
+   account that can never be unlocked again (see
+   [Sharing a vault between devices and clients](#sharing-a-vault-between-devices-and-clients)).
 
 ## Limits to keep in mind
 
