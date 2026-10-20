@@ -46,6 +46,12 @@ the client, which leaves it out of the request and stores it where the response 
 (`handle_http`, as the Android app does), or handed over whole and stored by the local server
 under the lock of the request (`handle_http_buffered`, as the extension does).
 
+What a client copies when the vault moves to another folder is worked out here too: the accounts
+that the other folder does not have (`accounts_missing_in`), and of those that it has, the files
+of the device and the content of attachments that it does not have yet
+(`device_files_missing_in`). A client calls them, copies what they give in the order that they
+give it in, and does only the copying itself, as a stream.
+
 The rules that a client checks itself against are here as well, so that its tests do not hold a
 copy of them:
 
@@ -54,8 +60,6 @@ copy of them:
 | `is_answered` | Every request that its code can make: answered, or refused as needing a server. |
 | `FLAGS_THAT_MUST_BE_OFF` | Its feature flags that move requests out of reach of the local server: still there, and off by default. |
 | `check_file_system` | Its file system keeps the rules that the vault store counts on. |
-| `accounts_missing_in` | The accounts that it copies when the vault moves to another folder. |
-| `device_files_missing_in` | The files of its device, and the content of attachments, that it copies to the accounts that the other folder already has. |
 
 ## Where the earlier implementations differed
 

@@ -69,12 +69,26 @@ The HTTP boundary was chosen for these reasons:
 The database and the settings that a client already had are still what they were: a cache of
 what "the server" holds. Only the server behind them is now the vault folder.
 
+The first of the reasons above is the one that decided where the boundary is. The clients are
+forks, and each file of upstream that a fork changes is one that every update from upstream has
+to be merged into. The boundary therefore also holds for what the local vault takes on: what a
+Bitwarden server would do with a request, and never what a client does when it talks to a server,
+such as putting a request together or reading a response into its models. That stays in the code
+that the clients have from upstream, even where every client does it the same way, as a client
+could only hand it over by changing that code.
+
 ## What the local vault does, and what a client does
 
-The local vault does everything that is the same for every client, so that the clients that
+The local vault does the work of a Bitwarden server for every client, so that the clients that
 share a vault folder read and write it the same way and answer their requests the same way. It is
 used as a Rust crate (`crates/local-vault`), through UniFFI from Kotlin
 (`crates/local-vault-uniffi`), or as WebAssembly from JavaScript (`crates/local-vault-wasm`).
+
+Besides the work of the server, the local vault only has code that the forks added to the clients
+and that is the same in all of them, such as the rules that a client checks itself against and
+what it copies when the vault moves to another folder. Code that the clients have from upstream
+never moves into the local vault, and neither does code whose move would change a file of
+upstream (see [The approach](#the-approach)).
 
 | The local vault | A client |
 |-----------------|----------|
@@ -334,7 +348,7 @@ register, and registering the address again must be avoided: on a device that th
 not arrived on yet, it makes a second account with the same address instead of opening the
 first (see [Limits to keep in mind](#limits-to-keep-in-mind)).
 
-Three mechanisms make this work, and the local vault implements them for every client.
+Four mechanisms make this work, and the local vault implements them for every client.
 
 **Noticing a change from outside.** Before a sync, a client asks when the vault last changed and
 skips the sync if that is before its last sync. A file that a sync tool brought in can carry a
@@ -357,6 +371,16 @@ another device.
 **Changing the master password.** The change replaces the verifier and the encrypted user key,
 and gives the account a new security stamp. Every other client sees the new stamp at its next
 sync and logs the account out, as its copy of the user key is unlocked with the old password.
+
+**Changing the KDF settings.** The change replaces the verifier and the encrypted user key as
+well, with those of the master key that the new settings derive, but keeps the user key and the
+security stamp, so no client is logged out. Every other client takes the new settings at its next
+sync. Until then it still unlocks the vault with the settings from before, as its copy of the
+user key is encrypted with the master key that they derive, but a request with which it proves
+the master password, such as deleting the account or changing the settings again, is refused as
+if the master password were wrong: the hash that it derives with the settings from before is not
+the one that the vault knows the master password by. A client therefore syncs before it changes
+the settings. Logging in is not affected, as a client asks how to derive the master key first.
 
 ## What works and what does not
 
@@ -400,9 +424,11 @@ file system and the setting for the vault folder. A workable order:
 6. **Close the ways out**: unreachable addresses for the client and the SDK, no feature flags,
    a test that the flags of `FLAGS_THAT_MUST_BE_OFF` that the client has are off, and no
    refusing to work when offline.
-7. **Add the setting for the vault folder**, with a copy of `accounts_missing_in` that never
-   overwrites an account that is already in the chosen folder, and of `device_files_missing_in`
-   for the files of the device in the accounts that it has.
+7. **Add the setting for the vault folder.** When the vault moves to the chosen folder, the
+   client copies what `accounts_missing_in` and `device_files_missing_in` give, in the order that
+   they give it in, and nothing else, which never overwrites an account that the folder already
+   has (see [Moving the vault to another folder](#moving-the-vault-to-another-folder)). It calls
+   them rather than holding a copy of them, and does only the copying, as a stream.
 8. **Test with two clients on one folder**: register on one and log in on the other, change an
    item on both, and change the master password on one to see the other log out.
 
@@ -426,6 +452,10 @@ file system and the setting for the vault folder. A workable order:
   folder can therefore decrypt the vault, items added after the change included. If the master
   password may be known to someone else, export the vault, import it into a new account, and
   delete the old account, which deletes the files of every device.
+- **Stronger KDF settings do not protect what the folder held before.** The user key encrypted
+  with the master key of the settings from before stays in the folder in the same places as after
+  a change of the master password, and is in every copy of the folder from before the change: the
+  master password is as easy to guess from it as it was.
 - **A deletion is forgotten after 90 days** once no other file holds the record. A device that
   changed the record before it was deleted and comes back later than that brings it back.
 - **A version that another device replaced is kept for 90 days.** A device that gets the files
