@@ -17,7 +17,7 @@ pub const LOCAL_VAULT_FORMAT: &str = "bitwarden-local-vault";
 pub const LOCAL_VAULT_VERSION: i64 = 2;
 
 /// The version of the layout before this one, in which the `vault.json` of an account held the
-/// whole vault.
+/// whole vault. The devices took such vaults over into their files, and they are no longer read.
 const SINGLE_FILE_VERSION: i64 = 1;
 
 pub(crate) const KEY_FORMAT: &str = "format";
@@ -32,9 +32,14 @@ const VAULT_BACKUP_FILE: &str = "vault.json.bak";
 const DEVICES_DIRECTORY: &str = "devices";
 const ATTACHMENTS_DIRECTORY: &str = "attachments";
 
-/// The files that can hold a complete vault, in the order they are trusted. Only an interrupted
-/// write leaves the vault in anything but the first.
-const VAULT_READ_ORDER: [&str; 3] = [VAULT_FILE, VAULT_TEMP_FILE, VAULT_BACKUP_FILE];
+/// The files that can hold the complete file of a device, in the order they are trusted. Only an
+/// interrupted write leaves it in anything but the first.
+const DEVICE_READ_ORDER: [&str; 3] = [VAULT_FILE, VAULT_TEMP_FILE, VAULT_BACKUP_FILE];
+
+/// The files that can hold the complete `vault.json` of an account, in the order they are trusted.
+/// Its backup is not read: `vault.json.tmp` is complete whenever a write of it is interrupted, and
+/// the backup can hold a vault of the earlier layout that a device took over.
+const ACCOUNT_READ_ORDER: [&str; 2] = [VAULT_FILE, VAULT_TEMP_FILE];
 
 /// The value of the `format` field of the `vault.json` of an account that was deleted. It is not
 /// that of a vault, so that a client that does not know it takes the account to be of a layout
@@ -49,12 +54,15 @@ const ON_ITS_WAY_MESSAGE: &str = "The vault of the account has not fully come to
 const UNKNOWN_LAYOUT_MESSAGE: &str =
     "The vault of the account has a layout that is not known: a newer client wrote it.";
 
+const EARLIER_LAYOUT_MESSAGE: &str =
+    "The vault of the account has the layout of version 1, which this client no longer reads.";
+
 /// Reads and writes the vault of each account on top of a [`FileSystem`].
 ///
 /// Every account has a directory named after its ID. Every device that shares the vault folder
 /// writes a file of its own in it, which nothing else writes, and the vault is put together from
 /// the files of all devices (see `merge.rs`). The `vault.json` of the account only says which
-/// layout the directory has, so that a client that knows only the earlier one leaves it alone:
+/// layout the directory has, or that the account was deleted:
 ///
 /// ```text
 /// <account id>/vault.json
@@ -62,8 +70,8 @@ const UNKNOWN_LAYOUT_MESSAGE: &str =
 /// <account id>/attachments/<cipher id>/<attachment id>
 /// ```
 ///
-/// In the earlier layout, `vault.json` held the whole vault. Such a vault is read as one more
-/// file, and the first device that writes the vault takes it over.
+/// In the earlier layout, `vault.json` held the whole vault, which the devices took over into
+/// their files. Such a vault is no longer read: an account that still has one cannot be used.
 pub(crate) struct LocalVaultStore<F> {
     file_system: F,
     /// The ID of this device, which names the directory that it writes its files in. The local
@@ -98,12 +106,15 @@ pub(crate) enum Unusable {
     /// account, or none holds that of its master password. A tool that syncs the vault folder
     /// does not bring files in the order that they were written, so the one that holds it is
     /// still on its way: the `vault.json` of the account can come before the file of the device
-    /// that took a vault of the earlier layout over, the file of a device that left the master
-    /// password out, as another device holds a newer one, before the file of that other device,
-    /// and the files of the devices before the `vault.json` of the account.
+    /// that registered the account, the file of a device that left the master password out, as
+    /// another device holds a newer one, before the file of that other device, and the files of
+    /// the devices before the `vault.json` of the account.
     OnItsWay,
     /// A file of the account has a layout that is not known, which a newer client wrote.
     UnknownLayout,
+    /// The `vault.json` of the account holds a vault of the earlier layout, which no device took
+    /// over, and which is no longer read.
+    EarlierLayout,
 }
 
 impl Unusable {
@@ -113,6 +124,7 @@ impl Unusable {
         match self {
             Self::OnItsWay => ON_ITS_WAY_MESSAGE,
             Self::UnknownLayout => UNKNOWN_LAYOUT_MESSAGE,
+            Self::EarlierLayout => EARLIER_LAYOUT_MESSAGE,
         }
     }
 }
@@ -138,33 +150,26 @@ impl From<IoError> for ReadError {
 struct AccountFiles {
     /// Whether `vault.json` says that the directory has this layout.
     has_marker: bool,
-    /// A vault of the earlier layout in `vault.json`, until a device takes it over, with its
-    /// versions in their place among those of the devices (see [`Source::earlier`]).
-    single_file: Option<Source>,
     /// The files of the devices, sorted by the IDs of the devices.
     devices: Vec<Source>,
 }
 
 impl AccountFiles {
-    fn sources(&self) -> impl Iterator<Item = &Source> {
-        self.single_file.iter().chain(&self.devices)
-    }
-
     /// Takes the file of the device out of the files, if there is one.
     fn take_device(&mut self, device_id: &str) -> Option<Source> {
-        let is_device = |source: &Source| source.device_id.as_deref() == Some(device_id);
+        let is_device = |source: &Source| source.device_id == device_id;
         let index = self.devices.iter().position(is_device)?;
         Some(self.devices.remove(index))
     }
 
     /// The versions that the vault is made of (see [`merge::merge`]).
     fn merged(&self) -> Versions {
-        merge::merge(self.sources().map(|source| &source.versions))
+        merge::merge(self.devices.iter().map(|source| &source.versions))
     }
 
     /// The latest date that one of the files was written at.
     fn revision_date(&self) -> Value {
-        let dates = self.sources().map(|source| &source.revision_date);
+        let dates = self.devices.iter().map(|source| &source.revision_date);
         let latest = dates.max_by_key(|date| date.as_str().and_then(parse_date_millis));
         latest.cloned().unwrap_or(Value::Null)
     }
@@ -209,7 +214,7 @@ impl<F: FileSystem> LocalVaultStore<F> {
     ///
     /// Fails if no account has the email but the vault of an account cannot be used for now, as
     /// the email may be that of this one: one that is still on its way, or that has a layout
-    /// that is not known. A client that is told that no account has the email would derive the
+    /// that is not read. A client that is told that no account has the email would derive the
     /// master key the default way, take the master password to be wrong, or register the email
     /// again. The error names the first such account, as long as no account with the email is
     /// found that the request can go by.
@@ -255,8 +260,9 @@ impl<F: FileSystem> LocalVaultStore<F> {
     /// being written: a newer client may have written it, and what it says is not known.
     ///
     /// Fails if the file that holds the record of the account, or that of its master password,
-    /// has not come yet, or if a file of the account has a layout that is not known, as the
-    /// account may well be there: a client that is told that it is not there logs it out.
+    /// has not come yet, or if a file of the account has a layout that is not known, or the
+    /// earlier one, as the account may well be there: a client that is told that it is not there
+    /// logs it out.
     pub(crate) async fn read_vault(
         &self,
         account_id: &str,
@@ -308,9 +314,7 @@ impl<F: FileSystem> LocalVaultStore<F> {
     /// is given no longer has. A request writes the vault that it read once.
     ///
     /// Nothing else is written, apart from the `vault.json` of the account by the device that the
-    /// account first has a file of, which says that the account has this layout, and the backup
-    /// of that `vault.json`, which is deleted once it holds a vault of the earlier layout that
-    /// this device took over.
+    /// account first has a file of, which says that the account has this layout.
     ///
     /// The file that is replaced is kept as the backup, and an interrupted write never leaves
     /// the device without a complete file. The change stands once that file is written: a
@@ -340,91 +344,52 @@ impl<F: FileSystem> LocalVaultStore<F> {
         for ids in merge::removed_attachments(&read.base, &changes) {
             own.removed_attachments.insert(ids, now_millis);
         }
-        // A vault of the earlier layout becomes part of the file of the first device that writes.
-        if let Some(single_file) = &files.single_file {
-            merge::take_over(
-                &mut own.versions,
-                &single_file.versions,
-                &files.devices,
-                now_millis,
-                &self.device_id,
-            );
-        }
         own.versions.extend(changes);
-        let others: Vec<&Source> = files.sources().collect();
-        merge::tidy(&mut own.versions, &self.device_id, &others, now_millis);
+        let others: Vec<&Source> = files.devices.iter().collect();
+        merge::tidy(&mut own.versions, &others, now_millis);
         own.revision_date = vault.get(KEY_REVISION_DATE).cloned().unwrap_or(Value::Null);
-        self.write_own_file(account_id, &own, now_millis).await?;
-        // Only the device that the account first has a file of writes it: the one that takes a
-        // vault of the earlier layout over, or the only one that has a file, as the device that
-        // registers the account does. Another device that does not have it yet gets it from that
-        // device. If it wrote it, it could do so as a device that deletes the account writes
-        // there that the account was deleted, which a tool that syncs the folder may resolve by
-        // keeping its file.
+        self.write_own_file(account_id, &own).await?;
+        // Only the device that the account first has a file of writes it: the only one that has
+        // a file, as the device that registers the account does. Another device that does not have
+        // it yet gets it from that device. If it wrote it, it could do so as a device that deletes
+        // the account writes there that the account was deleted, which a tool that syncs the
+        // folder may resolve by keeping its file.
         //
-        // The change is written by now, so neither that `vault.json` nor the backup that it
-        // leaves fails it when it cannot be written or deleted: the client would make the change
-        // again. The next write writes the `vault.json`, which is still missing then, unless
-        // another device has a file of the account by then: no device writes it then, and the
-        // account goes without it, which only a device that has none of the files of its devices
-        // takes for an account that is not there. `tidy` deletes the backup.
-        if !files.has_marker && (files.single_file.is_some() || files.devices.is_empty()) {
-            let is_marked = self.write_file(&[account_id], &marker()).await.is_ok();
-            // Only then does the backup hold the vault of the earlier layout in its place.
-            if is_marked && files.single_file.is_some() {
-                let _ = self.delete_earlier_vault(account_id).await;
-            }
+        // The change is written by now, so that `vault.json` does not fail it when it cannot be
+        // written: the client would make the change again. The next write writes it, as it is
+        // still missing then, unless another device has a file of the account by then: no device
+        // writes it then, and the account goes without it, which only a device that has none of
+        // the files of its devices takes for an account that is not there.
+        if !files.has_marker && files.devices.is_empty() {
+            let _ = self.write_file(&[account_id], &marker()).await;
         }
         Ok(())
     }
 
     /// Leaves out of the file of this device what it no longer has to hold, and deletes the
     /// content of the attachments that it removed once nothing can bring them back. The vault
-    /// stays the same: what is left out is either replaced by a version that another device
-    /// holds, which every device has had time to get, or a deletion that is no longer needed. A
-    /// vault of the earlier layout is left to be taken over by the next write, and one that a
-    /// device took over without deleting it after is deleted (see
-    /// [`Self::delete_earlier_vault`]).
+    /// stays the same: a version that is left out is replaced by one that another device holds,
+    /// which every device has had time to get, one that is replaced by a deletion of another device
+    /// is not in the vault either way, and a deletion that is left out is no longer needed.
     ///
     /// The content of an attachment is shared by every device, and a device that had not seen
     /// the removal yet can bring the attachment back with a change of the item, so it is only
     /// deleted as [`merge::removal`] says. Content that cannot be deleted is deleted the next
     /// time.
     ///
-    /// Fails if the file of this device could not be written, or the backup of the `vault.json`
-    /// of the account could not be deleted, after it tried both: each can hold what a change of
-    /// the master password replaced.
+    /// Fails if the file of this device could not be written.
     pub(crate) async fn tidy(&self, account_id: &str, now_millis: i64) -> Result<(), IoError> {
         let mut files = match self.read_files(account_id, Scope::Vault).await {
             Ok(Some(files)) => files,
             Ok(None) | Err(ReadError::Unusable(..)) => return Ok(()),
             Err(ReadError::Io(error)) => return Err(error),
         };
-        let tidied = self.tidy_own_file(account_id, &mut files, now_millis).await;
-        if files.has_marker {
-            self.delete_earlier_vault(account_id).await?;
-        }
-        tidied
-    }
-
-    /// Does what [`Self::tidy`] does with the file of this device, given the files of the
-    /// account.
-    async fn tidy_own_file(
-        &self,
-        account_id: &str,
-        files: &mut AccountFiles,
-        now_millis: i64,
-    ) -> Result<(), IoError> {
-        if files.single_file.is_some() {
-            return Ok(());
-        }
-        // What the file of this device leaves out does not change the vault (see `Self::tidy`).
         let merged = files.merged();
         let Some(mut own) = files.take_device(&self.device_id) else {
             return Ok(());
         };
-        let others: Vec<&Source> = files.sources().collect();
-        let mut is_changed = merge::tidy(&mut own.versions, &self.device_id, &others, now_millis);
+        let others: Vec<&Source> = files.devices.iter().collect();
+        let mut is_changed = merge::tidy(&mut own.versions, &others, now_millis);
         // The items that the vault no longer has, whose content is gone now.
         let mut gone = BTreeSet::new();
         for (ids, removed_at) in std::mem::take(&mut own.removed_attachments) {
@@ -451,19 +416,14 @@ impl<F: FileSystem> LocalVaultStore<F> {
             self.delete_item_directory(account_id, cipher_id).await;
         }
         if is_changed {
-            self.write_own_file(account_id, &own, now_millis).await?;
+            self.write_own_file(account_id, &own).await?;
         }
         Ok(())
     }
 
     /// Replaces the file of this device in the directory of the account.
-    async fn write_own_file(
-        &self,
-        account_id: &str,
-        own: &Source,
-        now_millis: i64,
-    ) -> Result<(), IoError> {
-        let file = own.to_file(now_millis);
+    async fn write_own_file(&self, account_id: &str, own: &Source) -> Result<(), IoError> {
+        let file = own.to_file();
         let directory = [account_id, DEVICES_DIRECTORY, self.device_id.as_str()];
         self.write_file(&directory, &Value::Object(file)).await
     }
@@ -562,18 +522,6 @@ impl<F: FileSystem> LocalVaultStore<F> {
         }
     }
 
-    /// Deletes the backup of the `vault.json` of an account of this layout. Writing that
-    /// `vault.json` in place of a vault of the earlier layout leaves that vault in the backup,
-    /// and it is never written again, so the backup would keep the vault for good: the user key
-    /// encrypted with the master password of that time included, which a change of the master
-    /// password is meant to leave nowhere. The vault is in the files of the devices by then.
-    /// Nothing reads the backup but in place of a `vault.json` that is not complete, which would
-    /// take the vault over again and bring back what was deleted since.
-    async fn delete_earlier_vault(&self, account_id: &str) -> Result<bool, IoError> {
-        let path = [account_id, VAULT_BACKUP_FILE];
-        self.file_system.delete(&path).await
-    }
-
     /// Reads the records in the scope of the files of the vault of the account, or returns `None`
     /// if the account is not there: it was deleted, or the directory is not that of an account.
     /// Fails with [`Unusable::UnknownLayout`] if a file has a layout that is not known.
@@ -585,19 +533,17 @@ impl<F: FileSystem> LocalVaultStore<F> {
         if !is_safe_segment(account_id) {
             return Ok(None);
         }
-        let unknown_layout = || {
-            let why = Unusable::UnknownLayout;
-            ReadError::Unusable(account_id.to_owned(), why)
-        };
+        let unusable = |why| ReadError::Unusable(account_id.to_owned(), why);
         let mut files = AccountFiles::default();
-        // The vault of the earlier layout, if the account has one.
-        let mut earlier = None;
-        match self.read_content(&[account_id]).await? {
+        let directory = [account_id];
+        match self.read_content(&directory, &ACCOUNT_READ_ORDER).await? {
             Content::Nothing => {}
             Content::Vault(Some(LOCAL_VAULT_VERSION), _) => files.has_marker = true,
-            Content::Vault(Some(SINGLE_FILE_VERSION), vault) => earlier = Some(vault),
+            Content::Vault(Some(SINGLE_FILE_VERSION), _) => {
+                return Err(unusable(Unusable::EarlierLayout));
+            }
             // A newer client wrote it, so the account may well be there.
-            Content::Vault(..) => return Err(unknown_layout()),
+            Content::Vault(..) => return Err(unusable(Unusable::UnknownLayout)),
             // The files of the devices are what is left of the account, if anything, or the
             // directory is not that of an account at all.
             Content::Deleted | Content::Unknown => return Ok(None),
@@ -605,7 +551,7 @@ impl<F: FileSystem> LocalVaultStore<F> {
         let devices_directory = [account_id, DEVICES_DIRECTORY];
         for device_id in safe_names(&self.file_system, &devices_directory).await? {
             let directory = [account_id, DEVICES_DIRECTORY, device_id.as_str()];
-            match self.read_content(&directory).await? {
+            match self.read_content(&directory, &DEVICE_READ_ORDER).await? {
                 Content::Nothing => {}
                 Content::Vault(Some(LOCAL_VAULT_VERSION), file) => {
                     let source = Source::device(device_id.clone(), &file, scope);
@@ -613,22 +559,19 @@ impl<F: FileSystem> LocalVaultStore<F> {
                 }
                 // Only a client that knows another layout writes anything else there.
                 Content::Vault(..) | Content::Deleted | Content::Unknown => {
-                    return Err(unknown_layout());
+                    return Err(unusable(Unusable::UnknownLayout));
                 }
             }
         }
-        // A client that knows only the earlier layout can have written it again since a device
-        // took it over, so its versions are put in their place among those of the devices.
-        files.single_file = earlier.map(|vault| Source::earlier(&vault, &files.devices, scope));
         Ok(Some(files))
     }
 
-    /// Reads the first file of the directory that is complete. The files after it are only
-    /// there for a write that was interrupted, so they are not read in its place when it is not
-    /// a vault that can be used: they hold an older one, and writing that one back would replace
-    /// the one that is there.
-    async fn read_content(&self, directory: &[&str]) -> Result<Content, IoError> {
-        for file in VAULT_READ_ORDER {
+    /// Reads the first file of the directory that is complete, of those in the order. The files
+    /// after it are only there for a write that was interrupted, so they are not read in its place
+    /// when it is not a vault that can be used: they hold an older one, and writing that one back
+    /// would replace the one that is there.
+    async fn read_content(&self, directory: &[&str], order: &[&str]) -> Result<Content, IoError> {
+        for file in order {
             let bytes = self.file_system.read(&file_path(directory, file)).await?;
             // An interrupted write leaves a file that is not complete.
             let Some(value) = bytes.as_deref().and_then(json::parse) else {
@@ -818,20 +761,6 @@ mod tests {
         json::to_pretty_bytes(&Value::Object(vault))
     }
 
-    /// A vault of the earlier layout with an item, which was moved to the trash at the date if
-    /// there is one. That leaves the revision date of the item as it was.
-    fn single_file_with_item(deleted_date: &Value) -> Vec<u8> {
-        let mut vault = vault("a@example.com", "earlier");
-        vault.insert(KEY_VERSION.to_owned(), json!(1));
-        let item = json!({
-            "id": "item",
-            "revisionDate": "2026-10-11T11:00:00.000Z",
-            "deletedDate": deleted_date,
-        });
-        vault.get_mut(KEY_SYNC).unwrap()["ciphers"] = json!([item]);
-        json::to_pretty_bytes(&Value::Object(vault))
-    }
-
     fn marker_of(vault: Option<JsonObject>) -> Option<String> {
         let vault = vault?;
         let sync = obj(&vault, KEY_SYNC)?;
@@ -1009,23 +938,22 @@ mod tests {
     }
 
     #[test]
-    fn the_file_of_a_device_says_since_when_it_is_there() {
+    fn the_since_that_an_earlier_client_wrote_in_the_file_of_a_device_is_left_out() {
         let fs = MemoryFileSystem::new();
         let store = store_on(fs.clone());
         let path = device_file(DEVICE, VAULT_FILE);
         let file = || json::parse(&fs.get(&path).unwrap()).unwrap();
-
         write(&store, ID, "first");
-        save(&store, ID, &vault("a@example.com", "second"), NOW + 1);
-        assert_eq!(file()["since"], json!(NOW));
+        assert_eq!(file().get("since"), None);
 
-        // A file that does not say since when it is there is taken to be new.
-        let mut without_since = file();
-        let fields = without_since.as_object_mut().unwrap();
-        fields.shift_remove("since");
-        fs.put(&path, without_since.to_string());
-        save(&store, ID, &vault("a@example.com", "third"), NOW + 2);
-        assert_eq!(file()["since"], json!(NOW + 2));
+        // It is not part of the record of the account, so the vault does not have it, and the next
+        // write leaves it out.
+        let mut earlier = file();
+        earlier["since"] = json!(NOW);
+        fs.put(&path, earlier.to_string());
+        assert_eq!(read(&store, ID).unwrap().get("since"), None);
+        save(&store, ID, &vault("a@example.com", "second"), NOW + 1);
+        assert_eq!(file().get("since"), None);
     }
 
     #[test]
@@ -1061,41 +989,43 @@ mod tests {
     }
 
     #[test]
-    fn a_vault_of_the_earlier_layout_is_read_and_taken_over_by_the_first_write() {
+    fn a_vault_of_the_earlier_that_no_device_took_over_is_not_used_or_written() {
         let fs = MemoryFileSystem::new();
         fs.put(&[ID, VAULT_FILE], single_file("earlier"));
         let store = store_on(fs.clone());
+        let other_email = vault("other@example.com", "other");
+        save(&store, "account-b", &other_email, NOW);
+        let files = snapshot(&fs);
+        let earlier = ReadError::Unusable(ID.to_owned(), Unusable::EarlierLayout);
+        let find = |email: &str| find_ids(&store, email);
 
-        assert_eq!(marker_of(read(&store, ID)).as_deref(), Some("earlier"));
-        write(&store, ID, "changed");
-
-        let root = json::parse(&fs.get(&[ID, VAULT_FILE]).unwrap()).unwrap();
-        assert_eq!(root, marker());
-        // The vault of the earlier layout is in the file of the device now, and is not kept as
-        // the backup of `vault.json`.
-        assert_eq!(fs.get(&[ID, VAULT_BACKUP_FILE]), None);
-        let current = file_marker(&fs, &device_file(DEVICE, VAULT_FILE));
-        assert_eq!(current.as_deref(), Some("changed"));
-        assert_eq!(marker_of(read(&store, ID)).as_deref(), Some("changed"));
+        // The account is not taken to be gone, nor its email to be free, as a client from before
+        // this layout wrote it, but no device takes it over anymore.
+        assert_eq!(block_on(store.read_vault(ID)), Err(earlier.clone()));
+        assert_eq!(block_on(store.read_account(ID)), Err(earlier.clone()));
+        assert_eq!(find("a@example.com"), Err(earlier));
+        assert_eq!(find("other@example.com").unwrap(), ["account-b"]);
+        let changed = vault("a@example.com", "changed");
+        let new = ReadVault::default();
+        assert!(block_on(store.write_vault(ID, &new, &changed, NOW)).is_err());
+        block_on(store.tidy(ID, NOW)).unwrap();
+        assert_eq!(snapshot(&fs), files);
     }
 
     #[test]
-    fn a_vault_of_the_earlier_layout_that_is_left_as_the_backup_is_deleted_by_tidying() {
+    fn a_vault_of_the_earlier_layout_that_is_left_as_the_backup_is_not_read() {
         let fs = MemoryFileSystem::new();
-        fs.put(&[ID, VAULT_FILE], single_file("earlier"));
         let store = store_on(fs.clone());
-        let other = LocalVaultStore::new(fs.clone(), OTHER_DEVICE);
-        write(&store, ID, "changed");
+        write(&store, ID, "current");
         // A device took the vault over without deleting it after, as one that was interrupted
         // did, or one from before it was deleted.
         fs.put(&[ID, VAULT_BACKUP_FILE], single_file("earlier"));
 
-        // Any device deletes it, also one without a file of the account, which has nothing of
-        // its own to tidy.
-        block_on(other.tidy(ID, NOW)).unwrap();
+        // Not even in place of a `vault.json` that is missing, which leaves the account to the
+        // files of its devices.
+        block_on(fs.delete(&[ID, VAULT_FILE])).unwrap();
 
-        assert_eq!(fs.get(&[ID, VAULT_BACKUP_FILE]), None);
-        assert_eq!(marker_of(read(&store, ID)).as_deref(), Some("changed"));
+        assert_eq!(marker_of(read(&store, ID)).as_deref(), Some("current"));
     }
 
     #[test]
@@ -1270,52 +1200,6 @@ mod tests {
         write(&store, ID, "second");
         let root = json::parse(&fs.get(&[ID, VAULT_FILE]).unwrap()).unwrap();
         assert_eq!(root, marker());
-
-        // The device that takes a vault of the earlier layout over, whose backup is only deleted
-        // once `vault.json` no longer holds it.
-        let fs = MemoryFileSystem::new();
-        fs.put(&[ID, VAULT_FILE], single_file("earlier"));
-        fs.put(&[ID, VAULT_BACKUP_FILE], single_file("older"));
-        let failing = failing_on(&fs);
-        let marker_in = |name| file_marker(&fs, &[ID, name]);
-        write(&failing, ID, "changed");
-        assert_eq!(marker_in(VAULT_FILE).as_deref(), Some("earlier"));
-        assert_eq!(marker_in(VAULT_BACKUP_FILE).as_deref(), Some("older"));
-        assert_eq!(marker_of(read(&failing, ID)).as_deref(), Some("changed"));
-        let store = store_on(fs.clone());
-        write(&store, ID, "again");
-        let root = json::parse(&fs.get(&[ID, VAULT_FILE]).unwrap()).unwrap();
-        assert_eq!(root, marker());
-        assert_eq!(fs.get(&[ID, VAULT_BACKUP_FILE]), None);
-    }
-
-    #[test]
-    fn a_backup_that_cannot_be_deleted_does_not_keep_the_file_of_the_device_from_being_tidied() {
-        let fs = MemoryFileSystem::new();
-        let store = store_on(fs.clone());
-        let other = LocalVaultStore::new(fs.clone(), OTHER_DEVICE);
-        write(&store, ID, "first");
-        // The other device changes the master password, which the first one leaves out of its
-        // file right away.
-        let mut changed = vault("a@example.com", "first");
-        let verifier = json!({"masterPasswordVerifier": {"hash": "new"}});
-        changed.insert(KEY_ACCOUNT.to_owned(), verifier);
-        save(&other, ID, &changed, NOW + 1);
-        // A device took a vault of the earlier layout over without deleting it after.
-        fs.put(&[ID, VAULT_BACKUP_FILE], single_file("earlier"));
-        let failing = Failing {
-            fs: fs.clone(),
-            writes: Vec::new(),
-            deletions: vec![vec![ID, VAULT_BACKUP_FILE]],
-        };
-
-        let tidied = block_on(store_on(failing).tidy(ID, NOW + 2));
-
-        // It fails, to be tried again, but the file of the device is tidied all the same.
-        assert_eq!(tidied, Err(IoError::new("busy")));
-        let file = json::parse(&fs.get(&device_file(DEVICE, VAULT_FILE)).unwrap()).unwrap();
-        assert_eq!(file["records"].get("masterPassword"), None);
-        assert!(fs.get(&[ID, VAULT_BACKUP_FILE]).is_some());
     }
 
     #[test]
@@ -1341,69 +1225,6 @@ mod tests {
         write(&store, ID, "second");
         let root = json::parse(&fs.get(&[ID, VAULT_FILE]).unwrap()).unwrap();
         assert_eq!(root, marker());
-    }
-
-    #[test]
-    fn a_change_that_keeps_the_revision_date_of_an_item_of_the_earlier_layout_is_taken_over() {
-        let fs = MemoryFileSystem::new();
-        fs.put(&[ID, VAULT_FILE], single_file_with_item(&Value::Null));
-        let store = store_on(fs.clone());
-        let taken_over = read_for_change(&store, ID);
-        block_on(store.write_vault(ID, &taken_over, &taken_over.vault, NOW)).unwrap();
-        let deleted = |vault: &JsonObject| vault[KEY_SYNC]["ciphers"][0]["deletedDate"].clone();
-
-        // A client that knows only the earlier layout, which the `vault.json` that says that the
-        // account has this layout has not come to, moves the item to the trash, and the tool that
-        // syncs the folder keeps its file.
-        let trashed = json!("2026-10-11T11:30:00.000Z");
-        fs.put(&[ID, VAULT_FILE], single_file_with_item(&trashed));
-        let again = read_for_change(&store, ID);
-        assert_eq!(deleted(&again.vault), trashed);
-
-        // The device that took the vault over takes it over again when it writes, and the item
-        // stays in the trash once the vault of the earlier layout is gone.
-        block_on(store.write_vault(ID, &again, &again.vault, NOW + 1)).unwrap();
-        let root = json::parse(&fs.get(&[ID, VAULT_FILE]).unwrap()).unwrap();
-        assert_eq!(root, marker());
-        assert_eq!(deleted(&read(&store, ID).unwrap()), trashed);
-    }
-
-    #[test]
-    fn a_vault_of_the_earlier_layout_that_is_written_again_keeps_what_the_device_wrote() {
-        let fs = MemoryFileSystem::new();
-        fs.put(&[ID, VAULT_FILE], single_file_with_item(&Value::Null));
-        let store = store_on(fs.clone());
-        // The device takes the vault over with a change of the master password.
-        let taken_over = read_for_change(&store, ID);
-        let new_verifier = json!({"hash": "new"});
-        let account = json!({"masterPasswordVerifier": new_verifier});
-        let mut changed = taken_over.vault.clone();
-        changed.insert(KEY_ACCOUNT.to_owned(), account);
-        block_on(store.write_vault(ID, &taken_over, &changed, NOW)).unwrap();
-        // A client that knows only the earlier layout, which the `vault.json` of this layout has
-        // not come to, deletes the item an hour later, and the tool that syncs the folder keeps
-        // its `vault.json`. It has the master password from before the change.
-        let mut written_again = vault("a@example.com", "earlier");
-        written_again.insert(KEY_VERSION.to_owned(), json!(1));
-        let later = json!("2026-10-11T13:00:00.000Z");
-        written_again.insert(KEY_REVISION_DATE.to_owned(), later);
-        let content = json::to_pretty_bytes(&Value::Object(written_again));
-        fs.put(&[ID, VAULT_FILE], content);
-        let verifier = |vault: &JsonObject| vault[KEY_ACCOUNT]["masterPasswordVerifier"].clone();
-        let ciphers = |vault: &JsonObject| vault[KEY_SYNC]["ciphers"].clone();
-
-        // The vault keeps the master password that the device wrote, and the deletion.
-        let assembled = read(&store, ID).unwrap();
-        assert_eq!(verifier(&assembled), new_verifier);
-        assert_eq!(ciphers(&assembled), json!([]));
-        // So does the device once it took the vault over again.
-        let again = read_for_change(&store, ID);
-        block_on(store.write_vault(ID, &again, &again.vault, NOW + 1)).unwrap();
-        let root = json::parse(&fs.get(&[ID, VAULT_FILE]).unwrap()).unwrap();
-        assert_eq!(root, marker());
-        let assembled = read(&store, ID).unwrap();
-        assert_eq!(verifier(&assembled), new_verifier);
-        assert_eq!(ciphers(&assembled), json!([]));
     }
 
     #[test]
@@ -1459,12 +1280,15 @@ mod tests {
     #[test]
     fn a_file_with_a_byte_order_mark_is_read() {
         let fs = MemoryFileSystem::new();
+        let store = store_on(fs.clone());
+        write(&store, ID, "bak");
+        write(&store, ID, "current");
+        let path = device_file(DEVICE, VAULT_FILE);
         let mut content = b"\xef\xbb\xbf".to_vec();
-        content.extend(single_file("current"));
-        fs.put(&[ID, VAULT_FILE], content);
-        fs.put(&[ID, VAULT_BACKUP_FILE], single_file("bak"));
-        let store = store_on(fs);
+        content.extend(fs.get(&path).unwrap());
+        fs.put(&path, content);
 
+        // Not the backup, which a file that is taken to be incomplete leaves the device to.
         assert_eq!(marker_of(read(&store, ID)).as_deref(), Some("current"));
     }
 

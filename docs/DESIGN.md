@@ -169,9 +169,7 @@ device. It is the only code that knows the file layout, and it guarantees five t
 
 - A device only ever writes its own files, apart from `vault.json` of an account, which says
   which layout the account has, or that the account was deleted, and is the same on every
-  device, and its backup, which is deleted once it holds a vault of the earlier layout that a
-  device took over. A tool that syncs the folder never has to choose between two versions of a
-  file.
+  device. A tool that syncs the folder never has to choose between two versions of a file.
 - A write never leaves a device without a complete file: the new content goes to a temporary
   file, the old file becomes the backup, and the temporary file takes its place.
 - A change that is made after another one is newer than that one, even where the clock of the
@@ -183,20 +181,18 @@ device. It is the only code that knows the file layout, and it guarantees five t
   digits, `-` and `_` (`is_safe_segment`), so that no request can reach outside the vault folder.
 
 A device leaves out of its file what it no longer has to hold: a version that another device has
-a newer one of, or the same one if the ID of that device comes first, and a deletion that is old
-enough and that nothing could bring back anymore. The deletion of a folder is kept while a file
-has an item in the folder, which would otherwise be in a folder that is not there. A version of a
-record that another device deleted since is replaced by that deletion. A device does this when it
-writes its file, and when its client syncs, once a day at most, and again at the next sync if it
-could not, as it is also what leaves an older master password out.
+a newer one of, and a deletion that is old enough and that nothing could bring back anymore. The
+deletion of a folder is kept while a file has an item in the folder, which would otherwise be in a
+folder that is not there. A version of a record that another device deleted since is replaced by
+that deletion. A device does this when it writes its file, and when its client syncs, once a day
+at most, and again at the next sync if it could not, as it is also what leaves an older master
+password out.
 
 A tool that syncs the folder brings the files of an account in no particular order, so a third
 device can get the file that leaves a version out before the file with the newer one. A device
-therefore holds a version until the newer one has been in the file of the other device for 90
-days, the time that the format allows a file to take to come to every device (`GRACE_MILLIS`),
-and the third device has the record in the meantime, if not yet as it is now. Every file says
-since when it is there (`since`), as a version that a device took over from a vault of the
-earlier layout is much older than the file that holds it. One version is left out right away:
+therefore holds a version until the newer one was written 90 days ago, the time that the format
+allows a file to take to come to every device (`GRACE_MILLIS`), and the third device has the
+record in the meantime, if not yet as it is now. One version is left out right away:
 one of the master password, as its older versions hold what a change of the master password
 replaced. A version that a deletion replaced is replaced by that deletion right away, rather than
 left out: the device that deleted the record put the deletion in place of the version that it
@@ -217,9 +213,9 @@ have the item: a directory is deleted with everything in it, and the content of 
 of an item that the vault has can be on its way to it.
 
 A device can also have the `vault.json` that says that an account has this layout, or the file
-of another device, before any file with the record of the account: that of the device that took a
-vault of the earlier layout over, or that of the device that holds the newer record when the file
-that left the older one out came first. Such an account is not taken to be gone, as a 401 or a
+of another device, before any file with the record of the account: that of the device that
+registered the account, or that of the device that holds the newer record when the file that left
+the older one out came first. Such an account is not taken to be gone, as a 401 or a
 refresh token that is refused would make the client log it out. Its requests fail as ones that did
 not reach the server, which the client tries again. Its email is not known until the file comes,
 so a request that looks for an account by an email that no other account has fails the same way:
@@ -243,8 +239,7 @@ that it does not know, which it leaves alone.
 
 For the same reason, the `vault.json` that says that an account has this layout is only written
 by the device that the account first has a file of, which holds the record of the account: the
-one that registers the account, or that takes a vault of the earlier layout over. Another device
-gets it from that one. If it wrote it as well, it could do so as the account is deleted, and a
+one that registers the account. Another device gets it from that one. If it wrote it as well, it could do so as the account is deleted, and a
 tool that syncs the folder could keep its `vault.json` in place of the one that says that the
 account was deleted, and delete the file with the record of the account all the same: the account
 would be taken to be on its way for good, and no address that no other account has could be
@@ -255,14 +250,11 @@ device writes it. The account is used all the same, as the files of its devices 
 only a device that has none of those files yet takes it to be not there, as before any file of it
 has come, rather than on its way.
 
-A client that knows only the earlier layout can still write a vault of that layout after a device
-took it over, until the `vault.json` of this layout has come to it, and a tool that syncs the
-folder can keep that vault in place of the `vault.json`. That client rewrites the whole vault for
-any change, and its records of the account and of the master password have no stamp but the
-revision date of the vault, which every change moves on. So such a vault never wins over what a
-device wrote of the account or of the master password: any change on that client would otherwise
-bring back a master password that a device replaced. What it no longer has of what a device took
-over, it deleted, unless a device changed it since (`merge::after_take_over`).
+In the earlier layout, the `vault.json` of an account held the whole vault. The devices took such
+vaults over into their files, and they are no longer read: an account whose `vault.json` still
+holds one is treated as one with a file of a layout that is not known, but for good, as no device
+takes it over anymore. Its backup, where a device that took the vault over left it, is not read
+either.
 
 ### The file system
 

@@ -1,131 +1,152 @@
 {
-  "format": "bitwarden-local-vault",
-  "version": 1,
-  "revisionDate": "2026-01-01T11:00:00.000Z",
-  "account": {
-    "masterPasswordVerifier": {
-      "algorithm": "PBKDF2-SHA256",
-      "iterations": 100000,
-      "salt": "EBESExQVFhcYGRobHB0eHw==",
-      "hash": "ofu2PmRpsK/JS/wXl2EumoA1YukT0MkT2IVkon6qrKg="
-    }
-  },
-  "sync": {
-    "profile": {
-      "id": "11111111-2222-4333-8444-555555555555",
-      "name": null,
-      "email": "android@example.com",
-      "emailVerified": true,
-      "premium": true,
-      "premiumFromOrganization": false,
-      "masterPasswordHint": "hint",
-      "culture": "en-US",
-      "twoFactorEnabled": false,
-      "key": "2.aXYtMDAwMS1wYWRkaW5nISE=|ZGF0YS0wMDAx|bWFjLTAwMDEtcGFkZGluZy1wYWRkaW5nLXBhZGRpbmch",
-      "privateKey": "2.aXYtMDAwMy1wYWRkaW5nISE=|ZGF0YS0wMDAz|bWFjLTAwMDMtcGFkZGluZy1wYWRkaW5nLXBhZGRpbmch",
-      "accountKeys": {
-        "publicKeyEncryptionKeyPair": {
-          "wrappedPrivateKey": "2.aXYtMDAwMy1wYWRkaW5nISE=|ZGF0YS0wMDAz|bWFjLTAwMDMtcGFkZGluZy1wYWRkaW5nLXBhZGRpbmch",
-          "publicKey": "cHVibGljLWtleS1vZi10aGUtZml4dHVyZS1hY2NvdW50",
-          "signedPublicKey": null
-        },
-        "signatureKeyPair": null,
-        "securityState": null
-      },
-      "securityStamp": "99999999-8888-4777-8666-555555555555",
-      "forcePasswordReset": false,
-      "usesKeyConnector": false,
-      "avatarColor": null,
-      "creationDate": "2026-01-01T08:00:00.000Z",
-      "organizations": [],
-      "providers": [],
-      "providerOrganizations": [],
-      "object": "profile"
+    "format": "bitwarden-local-vault",
+    "version": 2,
+    "revisionDate": "2026-01-01T11:00:00.000Z",
+    "account": {
+        "masterPasswordVerifier": {
+            "algorithm": "PBKDF2-SHA256",
+            "iterations": 100000,
+            "salt": "EBESExQVFhcYGRobHB0eHw==",
+            "hash": "ofu2PmRpsK/JS/wXl2EumoA1YukT0MkT2IVkon6qrKg="
+        }
     },
-    "folders": [],
-    "collections": [],
-    "ciphers": [
-      {
-        "reprompt": 0,
-        "type": 1,
-        "login": {
-          "uris": [
+    "sync": {
+        "profile": {
+            "id": "11111111-2222-4333-8444-555555555555",
+            "name": null,
+            "email": "android@example.com",
+            "emailVerified": true,
+            "premium": true,
+            "premiumFromOrganization": false,
+            "culture": "en-US",
+            "twoFactorEnabled": false,
+            "privateKey": "2.aXYtMDAwMy1wYWRkaW5nISE=|ZGF0YS0wMDAz|bWFjLTAwMDMtcGFkZGluZy1wYWRkaW5nLXBhZGRpbmch",
+            "accountKeys": {
+                "publicKeyEncryptionKeyPair": {
+                    "wrappedPrivateKey": "2.aXYtMDAwMy1wYWRkaW5nISE=|ZGF0YS0wMDAz|bWFjLTAwMDMtcGFkZGluZy1wYWRkaW5nLXBhZGRpbmch",
+                    "publicKey": "cHVibGljLWtleS1vZi10aGUtZml4dHVyZS1hY2NvdW50",
+                    "signedPublicKey": null
+                },
+                "signatureKeyPair": null,
+                "securityState": null
+            },
+            "forcePasswordReset": false,
+            "usesKeyConnector": false,
+            "avatarColor": null,
+            "creationDate": "2026-01-01T08:00:00.000Z",
+            "organizations": [],
+            "providers": [],
+            "providerOrganizations": [],
+            "object": "profile",
+            "key": "2.aXYtMDAwMS1wYWRkaW5nISE=|ZGF0YS0wMDAx|bWFjLTAwMDEtcGFkZGluZy1wYWRkaW5nLXBhZGRpbmch",
+            "masterPasswordHint": "hint",
+            "securityStamp": "99999999-8888-4777-8666-555555555555"
+        },
+        "folders": [],
+        "collections": [],
+        "ciphers": [
             {
-              "uri": "2.aXYtMDAwNC1wYWRkaW5nISE=|ZGF0YS0wMDA0|bWFjLTAwMDQtcGFkZGluZy1wYWRkaW5nLXBhZGRpbmch",
-              "uriChecksum": "2.aXYtMDAwNS1wYWRkaW5nISE=|ZGF0YS0wMDA1|bWFjLTAwMDUtcGFkZGluZy1wYWRkaW5nLXBhZGRpbmch"
+                "reprompt": 0,
+                "type": 1,
+                "login": {
+                    "uris": [
+                        {
+                            "uri": "2.aXYtMDAwNC1wYWRkaW5nISE=|ZGF0YS0wMDA0|bWFjLTAwMDQtcGFkZGluZy1wYWRkaW5nLXBhZGRpbmch",
+                            "uriChecksum": "2.aXYtMDAwNS1wYWRkaW5nISE=|ZGF0YS0wMDA1|bWFjLTAwMDUtcGFkZGluZy1wYWRkaW5nLXBhZGRpbmch"
+                        }
+                    ],
+                    "totp": "2.aXYtMDAwNi1wYWRkaW5nISE=|ZGF0YS0wMDA2|bWFjLTAwMDYtcGFkZGluZy1wYWRkaW5nLXBhZGRpbmch",
+                    "password": "2.aXYtMDAwNy1wYWRkaW5nISE=|ZGF0YS0wMDA3|bWFjLTAwMDctcGFkZGluZy1wYWRkaW5nLXBhZGRpbmch",
+                    "username": "2.aXYtMDAwOC1wYWRkaW5nISE=|ZGF0YS0wMDA4|bWFjLTAwMDgtcGFkZGluZy1wYWRkaW5nLXBhZGRpbmch"
+                },
+                "name": "2.aXYtMDAwOS1wYWRkaW5nISE=|ZGF0YS0wMDA5|bWFjLTAwMDktcGFkZGluZy1wYWRkaW5nLXBhZGRpbmch",
+                "fields": [],
+                "favorite": false,
+                "key": "2.aXYtMDAxMC1wYWRkaW5nISE=|ZGF0YS0wMDEw|bWFjLTAwMTAtcGFkZGluZy1wYWRkaW5nLXBhZGRpbmch",
+                "id": "00000000-0000-4000-8000-000000000001",
+                "organizationId": null,
+                "collectionIds": [],
+                "edit": true,
+                "viewPassword": true,
+                "organizationUseTotp": false,
+                "permissions": {
+                    "delete": true,
+                    "restore": true
+                },
+                "attachments": null,
+                "creationDate": "2026-01-01T09:00:00.000Z",
+                "deletedDate": null,
+                "revisionDate": "2026-01-01T11:00:00.000Z",
+                "object": "cipherDetails"
+            },
+            {
+                "notes": "2.aXYtMDAxMS1wYWRkaW5nISE=|ZGF0YS0wMDEx|bWFjLTAwMTEtcGFkZGluZy1wYWRkaW5nLXBhZGRpbmch",
+                "reprompt": 0,
+                "type": 2,
+                "secureNote": {
+                    "type": 0
+                },
+                "name": "2.aXYtMDAxMi1wYWRkaW5nISE=|ZGF0YS0wMDEy|bWFjLTAwMTItcGFkZGluZy1wYWRkaW5nLXBhZGRpbmch",
+                "fields": [],
+                "favorite": false,
+                "key": "2.aXYtMDAxMy1wYWRkaW5nISE=|ZGF0YS0wMDEz|bWFjLTAwMTMtcGFkZGluZy1wYWRkaW5nLXBhZGRpbmch",
+                "id": "00000000-0000-4000-8000-000000000002",
+                "organizationId": null,
+                "collectionIds": [],
+                "edit": true,
+                "viewPassword": true,
+                "organizationUseTotp": false,
+                "permissions": {
+                    "delete": true,
+                    "restore": true
+                },
+                "attachments": null,
+                "creationDate": "2026-01-01T10:00:00.000Z",
+                "deletedDate": null,
+                "revisionDate": "2026-01-01T10:00:00.000Z",
+                "object": "cipherDetails"
             }
-          ],
-          "totp": "2.aXYtMDAwNi1wYWRkaW5nISE=|ZGF0YS0wMDA2|bWFjLTAwMDYtcGFkZGluZy1wYWRkaW5nLXBhZGRpbmch",
-          "password": "2.aXYtMDAwNy1wYWRkaW5nISE=|ZGF0YS0wMDA3|bWFjLTAwMDctcGFkZGluZy1wYWRkaW5nLXBhZGRpbmch",
-          "username": "2.aXYtMDAwOC1wYWRkaW5nISE=|ZGF0YS0wMDA4|bWFjLTAwMDgtcGFkZGluZy1wYWRkaW5nLXBhZGRpbmch"
+        ],
+        "policies": [],
+        "sends": [],
+        "domains": {
+            "equivalentDomains": [],
+            "globalEquivalentDomains": [],
+            "object": "domains"
         },
-        "name": "2.aXYtMDAwOS1wYWRkaW5nISE=|ZGF0YS0wMDA5|bWFjLTAwMDktcGFkZGluZy1wYWRkaW5nLXBhZGRpbmch",
-        "fields": [],
-        "favorite": false,
-        "key": "2.aXYtMDAxMC1wYWRkaW5nISE=|ZGF0YS0wMDEw|bWFjLTAwMTAtcGFkZGluZy1wYWRkaW5nLXBhZGRpbmch",
-        "id": "00000000-0000-4000-8000-000000000001",
-        "organizationId": null,
-        "collectionIds": [],
-        "edit": true,
-        "viewPassword": true,
-        "organizationUseTotp": false,
-        "permissions": {
-          "delete": true,
-          "restore": true
+        "userDecryption": {
+            "masterPasswordUnlock": {
+                "salt": "android@example.com",
+                "kdf": {
+                    "kdfType": 0,
+                    "iterations": 600000,
+                    "memory": null,
+                    "parallelism": null
+                },
+                "masterKeyEncryptedUserKey": "2.aXYtMDAwMS1wYWRkaW5nISE=|ZGF0YS0wMDAx|bWFjLTAwMDEtcGFkZGluZy1wYWRkaW5nLXBhZGRpbmch"
+            }
         },
-        "attachments": null,
-        "creationDate": "2026-01-01T09:00:00.000Z",
-        "deletedDate": null,
-        "revisionDate": "2026-01-01T11:00:00.000Z",
-        "object": "cipherDetails"
-      },
-      {
-        "notes": "2.aXYtMDAxMS1wYWRkaW5nISE=|ZGF0YS0wMDEx|bWFjLTAwMTEtcGFkZGluZy1wYWRkaW5nLXBhZGRpbmch",
-        "reprompt": 0,
-        "type": 2,
-        "secureNote": {
-          "type": 0
-        },
-        "name": "2.aXYtMDAxMi1wYWRkaW5nISE=|ZGF0YS0wMDEy|bWFjLTAwMTItcGFkZGluZy1wYWRkaW5nLXBhZGRpbmch",
-        "fields": [],
-        "favorite": false,
-        "key": "2.aXYtMDAxMy1wYWRkaW5nISE=|ZGF0YS0wMDEz|bWFjLTAwMTMtcGFkZGluZy1wYWRkaW5nLXBhZGRpbmch",
-        "id": "00000000-0000-4000-8000-000000000002",
-        "organizationId": null,
-        "collectionIds": [],
-        "edit": true,
-        "viewPassword": true,
-        "organizationUseTotp": false,
-        "permissions": {
-          "delete": true,
-          "restore": true
-        },
-        "attachments": null,
-        "creationDate": "2026-01-01T10:00:00.000Z",
-        "deletedDate": null,
-        "revisionDate": "2026-01-01T10:00:00.000Z",
-        "object": "cipherDetails"
-      }
-    ],
-    "policies": [],
-    "sends": [],
-    "domains": {
-      "equivalentDomains": [],
-      "globalEquivalentDomains": [],
-      "object": "domains"
+        "object": "sync"
     },
-    "userDecryption": {
-      "masterPasswordUnlock": {
-        "salt": "android@example.com",
-        "kdf": {
-          "kdfType": 0,
-          "iterations": 600000,
-          "memory": null,
-          "parallelism": null
+    "since": 1791720000000,
+    "records": {
+        "account": {
+            "at": 1767265200000,
+            "by": ""
         },
-        "masterKeyEncryptedUserKey": "2.aXYtMDAwMS1wYWRkaW5nISE=|ZGF0YS0wMDAx|bWFjLTAwMDEtcGFkZGluZy1wYWRkaW5nLXBhZGRpbmch"
-      }
+        "masterPassword": {
+            "at": 1767265200000,
+            "by": ""
+        },
+        "cipher:00000000-0000-4000-8000-000000000001": {
+            "at": 1767265200000,
+            "by": ""
+        },
+        "cipher:00000000-0000-4000-8000-000000000002": {
+            "at": 1767261600000,
+            "by": ""
+        }
     },
-    "object": "sync"
-  }
+    "tombstones": {},
+    "removedAttachments": {}
 }

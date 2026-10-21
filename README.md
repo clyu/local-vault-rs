@@ -85,8 +85,8 @@ copy of them:
 GitHub Actions does it all, in `.github/workflows/ci.yml`:
 
 - `cargo fmt`, `cargo clippy` with every warning an error, and `cargo test`. The tests of the
-  local server are in `crates/local-vault/tests`, and include a vault that the Android app wrote
-  (`tests/fixtures/android-vault.json`).
+  local server are in `crates/local-vault/tests`, and include a vault that the Android app wrote,
+  in the file of the device that took it over (`tests/fixtures/android-vault.json`).
 - The module for JavaScript, tested in Node with `wasm-pack test --node`, and built for webpack
   and for Node.
 - The libraries for every ABI of Android with `cargo ndk`, and their Kotlin.

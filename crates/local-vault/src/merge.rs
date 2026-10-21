@@ -39,8 +39,8 @@ const KEY_RECORDS: &str = "records";
 /// of the records.
 const KEY_TOMBSTONES: &str = "tombstones";
 
-/// The field of the file of a device with when the device first wrote it, in milliseconds since
-/// the epoch.
+/// The field of the file of a device in which earlier clients wrote when the device first wrote
+/// it. It is not part of the record of the account, and is left out when the file is written.
 const KEY_SINCE: &str = "since";
 
 /// The field of the file of a device with the attachments that the device removed from the
@@ -90,7 +90,7 @@ const MASTER_PASSWORD_FIELDS: [&[&str]; 5] = [
 /// be off for a while. A device holds a deletion that long once no other file has a version of
 /// the record from before it, as such a version may still be on its way: if it comes after the
 /// deletion is gone, the record is back. And it holds a version that another file has a newer one
-/// of until that one has been there that long, as a device that gets the file without the version
+/// of until that one was written that long ago, as a device that gets the file without the version
 /// before the file with the newer one would be without the record in the meantime. The content
 /// of an attachment that a device removed is kept that long as well, as a version of the item
 /// that has the attachment again may still be on its way.
@@ -121,7 +121,8 @@ impl Scope {
 pub(crate) struct Stamp {
     /// When the version was written, in milliseconds since the epoch.
     pub(crate) at: i64,
-    /// The ID of the device that wrote it. A version from a vault of the earlier layout has none.
+    /// The ID of the device that wrote it. A version that a device took over from a vault of the
+    /// earlier layout, or that a file does not have a stamp for, has none.
     pub(crate) by: String,
 }
 
@@ -193,16 +194,14 @@ fn offer(versions: &mut Versions, key: &str, version: Version) {
     }
 }
 
-/// A file of the vault of an account: that of a device, or a vault of the earlier layout.
+/// The file of a device in the vault of an account.
 #[derive(Default)]
 pub(crate) struct Source {
-    /// The device that wrote the file, or `None` for a vault of the earlier layout.
-    pub(crate) device_id: Option<String>,
+    /// The device that wrote the file.
+    pub(crate) device_id: String,
     pub(crate) versions: Versions,
     /// When the file was last written, as it says.
     pub(crate) revision_date: Value,
-    /// When the device first wrote the file, if it says.
-    pub(crate) since: Option<i64>,
     /// The attachments that the device removed and has yet to delete the content of.
     pub(crate) removed_attachments: RemovedAttachments,
 }
@@ -211,38 +210,22 @@ impl Source {
     /// The file of the device with the ID, with its versions in the scope (see
     /// [`device_versions`]).
     pub(crate) fn device(device_id: String, file: &JsonObject, scope: Scope) -> Self {
-        Self::new(Some(device_id), device_versions(file, scope), file)
-    }
-
-    /// A vault of the earlier layout, with its versions in the scope in their place among those
-    /// in the files of the devices (see [`after_take_over`]).
-    pub(crate) fn earlier(vault: &JsonObject, devices: &[Source], scope: Scope) -> Self {
-        let mut versions = single_file_versions(vault, scope);
-        after_take_over(&mut versions, devices, revision_millis(vault));
-        Self::new(None, versions, vault)
-    }
-
-    fn new(device_id: Option<String>, versions: Versions, file: &JsonObject) -> Self {
         let revision_date = file.get(KEY_REVISION_DATE).cloned();
         Self {
             device_id,
-            versions,
+            versions: device_versions(file, scope),
             revision_date: revision_date.unwrap_or(Value::Null),
-            since: int(file, KEY_SINCE),
             removed_attachments: removed_attachments_of(file),
         }
     }
 
     /// The file of the device that holds the versions, and the attachments that it removed and
-    /// has yet to delete the content of. A file that does not say since when it is there is
-    /// taken to be new from now on.
-    pub(crate) fn to_file(&self, now_millis: i64) -> JsonObject {
+    /// has yet to delete the content of.
+    pub(crate) fn to_file(&self) -> JsonObject {
         let account = self.versions.get(ACCOUNT_KEY);
         let account = account.and_then(|version| version.record.clone());
         let revision_date = self.revision_date.clone();
         let mut file = assemble(&account.unwrap_or_default(), &self.versions, revision_date);
-        let since = self.since.unwrap_or(now_millis);
-        file.insert(KEY_SINCE.to_owned(), Value::from(since));
         let mut records = JsonObject::new();
         let mut tombstones = JsonObject::new();
         for (key, version) in &self.versions {
@@ -264,17 +247,6 @@ impl Source {
             Value::Object(removed.collect()),
         );
         file
-    }
-
-    /// Returns `true` if the version has been in the file for [`GRACE_MILLIS`], so that every
-    /// device has had time to get it: that long since it was written, and since the file was, as
-    /// a version that a device took over from a vault of the earlier layout was written long
-    /// before. A file that does not say since when it is there is taken to be new.
-    fn has_come_everywhere(&self, version: &Version, now_millis: i64) -> bool {
-        self.since.is_some_and(|since| {
-            let held_since = version.stamp.at.max(since);
-            now_millis.saturating_sub(held_since) >= GRACE_MILLIS
-        })
     }
 }
 
@@ -343,61 +315,23 @@ fn records_of(vault: &JsonObject, scope: Scope) -> Vec<(String, JsonObject)> {
     records
 }
 
-/// The versions in a vault of the earlier layout that are in the scope. It has no stamps: a
-/// folder or an item is taken to have been written when its revision date says, and the account
-/// and its master password when the vault was, by no device in particular.
-fn single_file_versions(vault: &JsonObject, scope: Scope) -> Versions {
-    let vault_date = revision_millis(vault);
-    let mut versions = Versions::default();
-    for (key, record) in records_of(vault, scope) {
-        let date = string(&record, KEY_REVISION_DATE).and_then(parse_date_millis);
-        let at = if key == ACCOUNT_KEY || key == MASTER_PASSWORD_KEY {
-            vault_date
-        } else {
-            date.unwrap_or(vault_date)
-        };
-        let stamp = Stamp {
-            at,
-            by: String::new(),
-        };
-        offer(&mut versions, &key, Version::of(stamp, record));
-    }
-    versions
-}
-
-/// When a vault or the file of a device was last written, as it says, in milliseconds since the
-/// epoch, or 0 if it does not say. The records of the account and of its master password of a
-/// vault of the earlier layout are taken to have been written then, as it does not say when each
-/// of them changed.
-fn revision_millis(vault: &JsonObject) -> i64 {
-    let date = string(vault, KEY_REVISION_DATE).and_then(parse_date_millis);
-    date.unwrap_or(0)
-}
-
 /// The versions in the file of a device that are in the scope: its records with their stamps in
-/// `records`, and the deletions in `tombstones`. A folder or an item without a stamp is taken for
-/// one of the earlier layout. The record of the account and that of the master password are only
-/// in the file if `records` has a stamp for them (see [`master_password_stamp`]).
+/// `records`, and the deletions in `tombstones`. A folder or an item without a stamp is taken to
+/// have been written by no device in particular (see [`unstamped`]). The record of the account and
+/// that of the master password are only in the file if `records` has a stamp for them.
 fn device_versions(file: &JsonObject, scope: Scope) -> Versions {
     let no_stamps = JsonObject::new();
     let stamps = obj(file, KEY_RECORDS).unwrap_or(&no_stamps);
     let mut versions = Versions::default();
-    for (key, version) in single_file_versions(file, scope) {
+    for (key, record) in records_of(file, scope) {
+        let stamp = stamps.get(&key).and_then(Stamp::read);
         let stamp = match key.as_str() {
-            ACCOUNT_KEY => stamps.get(ACCOUNT_KEY).and_then(Stamp::read),
-            MASTER_PASSWORD_KEY => master_password_stamp(stamps, version.record.as_ref()),
-            _ => Some(
-                stamps
-                    .get(&key)
-                    .and_then(Stamp::read)
-                    .unwrap_or(version.stamp),
-            ),
+            ACCOUNT_KEY | MASTER_PASSWORD_KEY => stamp,
+            _ => Some(stamp.unwrap_or_else(|| unstamped(&record, file))),
         };
-        let Some(stamp) = stamp else {
-            continue;
-        };
-        let record = version.record;
-        offer(&mut versions, &key, Version { stamp, record });
+        if let Some(stamp) = stamp {
+            offer(&mut versions, &key, Version::of(stamp, record));
+        }
     }
     let tombstones = obj(file, KEY_TOMBSTONES).unwrap_or(&no_stamps);
     for (key, stamp) in tombstones {
@@ -408,15 +342,14 @@ fn device_versions(file: &JsonObject, scope: Scope) -> Versions {
     versions
 }
 
-/// The stamp of the master password in the file of a device that has the record, or `None` if
-/// the file does not hold it. A file that was written before the master password was a record of
-/// its own has its fields in the record of the account, with the stamp of that one: a file that
-/// holds no master password has none of the fields.
-fn master_password_stamp(stamps: &JsonObject, record: Option<&JsonObject>) -> Option<Stamp> {
-    let stamp = stamps.get(MASTER_PASSWORD_KEY).and_then(Stamp::read);
-    let is_in_account = record.is_some_and(|record| !record.is_empty());
-    let account_stamp = || stamps.get(ACCOUNT_KEY).and_then(Stamp::read);
-    stamp.or_else(|| account_stamp().filter(|_| is_in_account))
+/// The stamp of a folder or an item that the file of a device has no stamp for: when its revision
+/// date says, or else when the file was last written, by no device in particular.
+fn unstamped(record: &JsonObject, file: &JsonObject) -> Stamp {
+    let date = |object: &JsonObject| string(object, KEY_REVISION_DATE).and_then(parse_date_millis);
+    Stamp {
+        at: date(record).or_else(|| date(file)).unwrap_or(0),
+        by: String::new(),
+    }
 }
 
 /// Puts the versions of several files together: the newest version of each record, and the first
@@ -461,93 +394,6 @@ fn without_deleted_folders(versions: &mut Versions) {
 /// The ID of the folder that an item is in, in lower case, as it is in the key of the folder.
 fn folder_of(cipher: &JsonObject) -> Option<String> {
     string(cipher, "folderId").map(str::to_lowercase)
-}
-
-/// Puts the versions of a vault of the earlier layout, which was last written at `written_at`, in
-/// their place among those in the files of the devices. A client that knows only that layout can
-/// write such a vault again after a device took it over, as long as the `vault.json` of this
-/// layout has not come to it, and a tool that syncs the folder can keep the vault that it writes
-/// in place of that `vault.json`. That client does not see what the devices changed since, and it
-/// writes the whole vault for any change:
-///
-/// - Its records of the account and of its master password are taken to have been written when
-///   the vault was, which any change of that client moves on. A version of one of them that a
-///   device wrote, rather than took over, is newer than what that client holds, so the vault
-///   keeps that version: the next change of that client, of anything, would otherwise bring back
-///   the master password from before a change on a device.
-/// - A folder or an item that the file of a device holds in the version that a device took over,
-///   and that the vault no longer has, was deleted by that client: the vault holds a deletion of
-///   it as of when it was written. One that a device changed since it took it over is kept, as
-///   the vault does not say when it was deleted.
-///
-/// For a vault that nobody wrote again since a device took it over, this changes nothing in the
-/// vault that the files make up: the devices took over every version of it, and only wrote newer
-/// ones.
-fn after_take_over(earlier: &mut Versions, devices: &[Source], written_at: i64) {
-    // The records that a device took over, and the keys of the versions that a device wrote.
-    let mut taken_over = Vec::new();
-    let mut written = HashSet::new();
-    for (key, version) in devices.iter().flat_map(|file| &file.versions) {
-        if !is_taken_over(version) {
-            written.insert(key.as_str());
-        } else if version.record.is_some() {
-            taken_over.push(key.as_str());
-        }
-    }
-    for key in [ACCOUNT_KEY, MASTER_PASSWORD_KEY] {
-        if written.contains(key) {
-            earlier.shift_remove(key);
-        }
-    }
-    let stamp = Stamp {
-        at: written_at,
-        by: String::new(),
-    };
-    for key in taken_over {
-        let is_item = key.starts_with(FOLDER_PREFIX) || key.starts_with(CIPHER_PREFIX);
-        if is_item && !written.contains(key) && !earlier.contains_key(key) {
-            earlier.insert(key.to_owned(), Version::deletion(stamp.clone()));
-        }
-    }
-}
-
-/// Returns `true` if the version is one that a device took over from a vault of the earlier
-/// layout, which no device wrote.
-fn is_taken_over(version: &Version) -> bool {
-    version.stamp.by.is_empty()
-}
-
-/// Takes the versions of a vault of the earlier layout into the versions of the device with the
-/// ID, given the versions in the files of the other devices. A vault of the earlier layout is put
-/// together before the files of the devices, so of the versions of a record that are as new, its
-/// version is the one in the vault. A client that knows only that layout can change an item
-/// without changing its revision date, which is its stamp, so a file of a device can have another
-/// version with the same stamp. Such a version is stamped anew, so that it stays the one in the
-/// vault once the vault of the earlier layout is gone.
-pub(crate) fn take_over(
-    versions: &mut Versions,
-    earlier: &Versions,
-    others: &[Source],
-    now_millis: i64,
-    device_id: &str,
-) {
-    for (key, version) in earlier {
-        let mut is_newest = true;
-        let mut has_other_at_stamp = false;
-        let files = others.iter().map(|other| &other.versions);
-        for other in files.chain([&*versions]).filter_map(|file| file.get(key)) {
-            let is_as_new = other.stamp == version.stamp;
-            is_newest &= other.stamp <= version.stamp;
-            has_other_at_stamp |= is_as_new && other.record != version.record;
-        }
-        if is_newest && has_other_at_stamp {
-            let stamp = Stamp::next(Some(&version.stamp), now_millis, device_id);
-            let record = version.record.clone();
-            versions.insert(key.clone(), Version { stamp, record });
-        } else {
-            offer(versions, key, version.clone());
-        }
-    }
 }
 
 /// The vault that the versions make up, with the revision date, or `None` if they have no record
@@ -691,8 +537,8 @@ pub(crate) fn changes(
     changes
 }
 
-/// Leaves out of the versions of the device with the ID what it no longer has to hold, given the
-/// other files, and puts the deletions that they have in place of the versions that they replaced:
+/// Leaves out of the versions of a device what it no longer has to hold, given the other files,
+/// and puts the deletions that they have in place of the versions that they replaced:
 ///
 /// - a version that one of them has a newer one of is left out once every device has had time to
 ///   get that one, or right away if the record is that of the master password (see
@@ -700,24 +546,15 @@ pub(crate) fn changes(
 /// - a version that one of them has a newer deletion of is replaced by that deletion right away,
 ///   or by the newest one if several of them have one, unless it is left out (see
 ///   `newer_deletion`);
-/// - a version that the file of a device whose ID comes before this one has as well, with the same
-///   stamp and the same record, as two devices that took over the same vault of the earlier layout
-///   have, or two that hold the same deletion, is left out once every device has had time to get
-///   that file: of the devices that hold the same version, the first one keeps it;
-/// - a deletion that is older than [`GRACE_MILLIS`] and that none of them has an older version of
-///   the record for, which it would bring back, nor, for a folder, an item in the folder, which
+/// - a deletion that every device has had time to get, and that none of them has an older version
+///   of the record for, which it would bring back, nor, for a folder, an item in the folder, which
 ///   would then be in a folder that is not there, is left out (see `is_forgettable`).
 ///
 /// Returns `true` if anything was left out or replaced. Only the device that holds a version leaves
 /// it out, as no device writes the file of another. A tool that syncs the folder can bring the file
 /// without the version to a third device before the file that it was left to, which is why the
 /// version is held until every device has had time to get that one.
-pub(crate) fn tidy(
-    versions: &mut Versions,
-    device_id: &str,
-    others: &[&Source],
-    now_millis: i64,
-) -> bool {
+pub(crate) fn tidy(versions: &mut Versions, others: &[&Source], now_millis: i64) -> bool {
     let mut is_changed = false;
     for (key, version) in versions.iter_mut() {
         if is_replaced(key, version, others, now_millis) {
@@ -733,7 +570,6 @@ pub(crate) fn tidy(
         .iter()
         .filter(|(key, version)| {
             is_replaced(key, version, others, now_millis)
-                || is_held_before(key, version, device_id, others, now_millis)
                 || is_forgettable(key, version, own, others, now_millis)
         })
         .map(|(key, _)| key.clone())
@@ -751,9 +587,15 @@ fn is_replaced(key: &str, version: &Version, others: &[&Source], now_millis: i64
     others.iter().any(|other| {
         other.versions.get(key).is_some_and(|newer| {
             newer.stamp > version.stamp
-                && (key == MASTER_PASSWORD_KEY || other.has_come_everywhere(newer, now_millis))
+                && (key == MASTER_PASSWORD_KEY || has_come_everywhere(newer, now_millis))
         })
     })
+}
+
+/// Returns `true` if the version was written [`GRACE_MILLIS`] ago or longer, so that every device
+/// has had time to get it.
+fn has_come_everywhere(version: &Version, now_millis: i64) -> bool {
+    now_millis.saturating_sub(version.stamp.at) >= GRACE_MILLIS
 }
 
 /// The newest deletion of the record that one of the other files has, if it is newer than the
@@ -778,25 +620,9 @@ fn is_older_held(key: &str, version: &Version, others: &[&Source]) -> bool {
         .any(|held| held.record.is_some() && held.stamp < version.stamp)
 }
 
-/// Returns `true` if a device whose ID comes before this one holds the same version, and every
-/// device has had time to get it from that one. A vault of the earlier layout is not one: the
-/// device that takes it over holds what it has from then on.
-fn is_held_before(
-    key: &str,
-    version: &Version,
-    device_id: &str,
-    others: &[&Source],
-    now_millis: i64,
-) -> bool {
-    others.iter().any(|other| {
-        let other_id = other.device_id.as_deref();
-        other_id.is_some_and(|other_id| other_id < device_id)
-            && other.versions.get(key) == Some(version)
-            && other.has_come_everywhere(version, now_millis)
-    })
-}
-
-/// Returns `true` if the version is a deletion that can be forgotten.
+/// Returns `true` if the version is a deletion that can be forgotten. It has to be older than
+/// [`GRACE_MILLIS`], the time that a file with an older version of the record, which forgetting it
+/// would bring back, can take to come.
 ///
 /// The deletion of a folder is not, as long as one of the files has an item in the folder. Such an
 /// item is in no folder only as long as the deletion is there (see `without_deleted_folders`), as
@@ -813,7 +639,7 @@ fn is_forgettable(
         files.any(|versions| has_item_in(versions, folder_id))
     };
     version.record.is_none()
-        && now_millis.saturating_sub(version.stamp.at) >= GRACE_MILLIS
+        && has_come_everywhere(version, now_millis)
         && !is_older_held(key, version, others)
         && !key.strip_prefix(FOLDER_PREFIX).is_some_and(is_in_use)
 }
@@ -955,12 +781,11 @@ mod tests {
         }))
     }
 
-    /// The file of another device with the versions, which it first wrote at `since`.
-    fn source(device_id: &str, versions: &Versions, since: i64) -> Source {
+    /// The file of another device with the versions.
+    fn source(device_id: &str, versions: &Versions) -> Source {
         Source {
-            device_id: Some(device_id.to_owned()),
+            device_id: device_id.to_owned(),
             versions: versions.clone(),
-            since: Some(since),
             ..Source::default()
         }
     }
@@ -969,14 +794,14 @@ mod tests {
         sources.iter().collect()
     }
 
-    /// The versions of the device `a` once it has left out what it no longer has to hold.
+    /// The versions of a device once it has left out what it no longer has to hold.
     fn tidied(versions: &Versions, others: &[Source], now_millis: i64) -> Versions {
         let mut tidied = versions.clone();
-        tidy(&mut tidied, "a", &refs(others), now_millis);
+        tidy(&mut tidied, &refs(others), now_millis);
         tidied
     }
 
-    /// The keys of the versions that the device `a` keeps.
+    /// The keys of the versions that a device keeps.
     fn kept(versions: &Versions, others: &[Source], now_millis: i64) -> Vec<String> {
         tidied(versions, others, now_millis).into_keys().collect()
     }
@@ -1100,17 +925,17 @@ mod tests {
         removed.insert(("C".to_owned(), "a1".to_owned()), 4);
         let device = Source {
             removed_attachments: removed.clone(),
-            ..source("a", &written, 1)
+            ..source("a", &written)
         };
 
-        let file = device.to_file(5);
-        let items_file = source("a", &only_items, 1).to_file(5);
+        let file = device.to_file();
+        let items_file = source("a", &only_items).to_file();
 
         assert_eq!(file["records"]["cipher:c"], json!({"at": 1, "by": "a"}));
         assert_eq!(file["tombstones"]["folder:f"], json!({"at": 2, "by": "a"}));
         assert_eq!(file["removedAttachments"], json!({"C/a1": 4}));
+        assert_eq!(file.get("since"), None);
         let read = Source::device("a".to_owned(), &file, Scope::Vault);
-        assert_eq!(read.since, Some(1));
         assert_eq!(read.removed_attachments, removed);
         for key in ["account", "masterPassword", "cipher:c", "folder:f"] {
             assert_eq!(read.versions.get(key), written.get(key), "{key}");
@@ -1157,7 +982,7 @@ mod tests {
     }
 
     #[test]
-    fn a_file_from_before_the_master_password_was_a_record_of_its_own_holds_it_in_the_account() {
+    fn the_master_password_is_only_in_a_file_with_a_stamp_for_it() {
         let mut file = vault(json!([]), json!([]));
         file.insert(
             "records".to_owned(),
@@ -1166,26 +991,24 @@ mod tests {
 
         let read = device_versions(&file, Scope::Vault);
 
-        let master_password = read.get("masterPassword").unwrap();
-        assert_eq!(master_password.stamp, stamp(3, "a"));
-        let verifier = json!({"account": {"masterPasswordVerifier": {"hash": "x"}}});
-        assert_eq!(master_password.record, Some(into_object(verifier)));
+        // Not with the stamp of the account, whatever fields of it the file has.
+        assert_eq!(keys(&read), ["account"]);
         assert_eq!(read.get("account").unwrap().stamp, stamp(3, "a"));
     }
 
     #[test]
-    fn a_vault_of_the_earlier_layout_is_stamped_by_its_revision_dates() {
-        let mut earlier = vault(
+    fn a_folder_or_an_item_without_a_stamp_is_stamped_by_its_revision_date() {
+        let file = vault(
             json!([{"id": "f"}]),
             json!([{"id": "c", "revisionDate": "2026-10-11T12:00:01.000Z"}]),
         );
-        earlier.insert("version".to_owned(), json!(1));
 
-        let read = single_file_versions(&earlier, Scope::Vault);
+        let read = device_versions(&file, Scope::Vault);
 
+        // Or by that of the file, and by no device. The record of the account and that of its
+        // master password are not in a file without their stamps.
         let noon = 1_791_720_000_000;
-        assert_eq!(read.get("account").unwrap().stamp, stamp(noon, ""));
-        assert_eq!(read.get("masterPassword").unwrap().stamp, stamp(noon, ""));
+        assert_eq!(keys(&read), ["folder:f", "cipher:c"]);
         assert_eq!(read.get("folder:f").unwrap().stamp, stamp(noon, ""));
         assert_eq!(read.get("cipher:c").unwrap().stamp, stamp(noon + 1_000, ""));
     }
@@ -1248,7 +1071,7 @@ mod tests {
             ("cipher:1", version(2 * DAY, "b", json!({"v": "b"}))),
             ("cipher:3", version(4 * DAY, "b", json!({"v": "b"}))),
         ]);
-        let others = [source("b", &newer, 0)];
+        let others = [source("b", &newer)];
         let due = 2 * DAY + GRACE_MILLIS;
         let waiting = ["account", "cipher:1", "cipher:3"];
 
@@ -1257,18 +1080,8 @@ mod tests {
         assert_eq!(kept(&own, &others, 3 * DAY), waiting);
         assert_eq!(kept(&own, &others, due - 1), waiting);
         assert_eq!(kept(&own, &others, due), ["cipher:3"]);
-        // That is as long after the file was first written, as a version that the device took
-        // over from a vault of the earlier layout was written long before, and a file that does
-        // not say when it was is taken to be new.
-        let new_file = [source("b", &newer, 3 * DAY)];
-        let unknown = [Source {
-            since: None,
-            ..source("b", &newer, 0)
-        }];
-        assert_eq!(kept(&own, &new_file, due), waiting);
-        assert_eq!(kept(&own, &unknown, due), waiting);
-        assert!(tidy(&mut own, "a", &refs(&others), due));
-        assert!(!tidy(&mut own, "a", &refs(&others), due));
+        assert!(tidy(&mut own, &refs(&others), due));
+        assert!(!tidy(&mut own, &refs(&others), due));
     }
 
     #[test]
@@ -1285,11 +1098,11 @@ mod tests {
         ]);
         let newest = versions(vec![("cipher:1", deletion(4 * DAY, "c"))]);
         let older = versions(vec![("cipher:1", version(DAY, "d", json!({"v": "d"})))]);
-        let others = [source("b", &newer, 0), source("c", &newest, 0)];
+        let others = [source("b", &newer), source("c", &newest)];
         let with_older = [
-            source("b", &newer, 0),
-            source("c", &newest, 0),
-            source("d", &older, 0),
+            source("b", &newer),
+            source("c", &newest),
+            source("d", &older),
         ];
         let due = 3 * DAY + GRACE_MILLIS;
         let replaced = versions(vec![
@@ -1307,8 +1120,8 @@ mod tests {
         // Once every device has had time to get a deletion, the item is left to it.
         assert_eq!(keys(&tidied(&own, &others, due)), ["cipher:2"]);
         let mut item = versions(vec![("cipher:1", version(2 * DAY, "a", json!({"v": "a"})))]);
-        assert!(tidy(&mut item, "a", &refs(&others), 4 * DAY));
-        assert!(!tidy(&mut item, "a", &refs(&others), 4 * DAY));
+        assert!(tidy(&mut item, &refs(&others), 4 * DAY));
+        assert!(!tidy(&mut item, &refs(&others), 4 * DAY));
     }
 
     #[test]
@@ -1368,40 +1181,14 @@ mod tests {
     }
 
     #[test]
-    fn of_the_devices_that_hold_the_same_version_the_first_one_keeps_it() {
-        let same = || version(1, "", json!({"id": "1"}));
-        let own = versions(vec![
-            ("cipher:1", same()),
-            ("cipher:2", version(1, "", json!({"id": "2", "v": "own"}))),
-            ("cipher:3", version(1, "", json!({"id": "3"}))),
-        ]);
-        let first = versions(vec![
-            ("cipher:1", same()),
-            ("cipher:2", version(1, "", json!({"id": "2", "v": "first"}))),
-        ]);
-        let earlier_layout = Source {
-            versions: versions(vec![("cipher:3", version(1, "", json!({"id": "3"})))]),
-            ..Source::default()
-        };
-        // The first device took the vault of the earlier layout over long after it was written.
-        let taken_over = 10 * DAY;
-        let files = [source("b", &first, taken_over), earlier_layout];
-        let others = refs(&files);
-        let due = taken_over + GRACE_MILLIS;
+    fn a_version_that_another_device_holds_as_well_is_kept() {
+        let same = version(1, "", json!({"id": "1"}));
+        let own = versions(vec![("cipher:1", same.clone())]);
+        let other = versions(vec![("cipher:1", same)]);
 
-        let mut too_soon = own.clone();
-        let mut later = own.clone();
-        let mut before = own.clone();
-        tidy(&mut too_soon, "c", &others, due - 1);
-        tidy(&mut later, "c", &others, due);
-        tidy(&mut before, "a", &others, due);
-
-        // The version is kept until every device has had time to get the file of the first
-        // device, and a version that differs, or that only a vault of the earlier layout has, is
-        // kept anyway.
-        assert_eq!(too_soon, own);
-        assert_eq!(keys(&later), ["cipher:2", "cipher:3"]);
-        assert_eq!(before, own);
+        // As two devices that took over the same vault of the earlier layout hold it: neither has
+        // a newer one, and each leaves it out once another device has one that replaces it.
+        assert_eq!(tidied(&own, &[source("b", &other)], 10 * GRACE_MILLIS), own);
     }
 
     #[test]
@@ -1413,9 +1200,9 @@ mod tests {
         let later = deleted_at + GRACE_MILLIS;
 
         assert_eq!(tidied(&own, &[], later - 1), own);
-        assert_eq!(tidied(&own, &[source("b", &holds_older, 0)], later), own);
+        assert_eq!(tidied(&own, &[source("b", &holds_older)], later), own);
         assert!(tidied(&own, &[], later).is_empty());
-        let deleted_too = tidied(&own, &[source("b", &deleted_too, 0)], later);
+        let deleted_too = tidied(&own, &[source("b", &deleted_too)], later);
         assert!(deleted_too.is_empty());
     }
 
@@ -1429,92 +1216,13 @@ mod tests {
         let later = deleted_at + GRACE_MILLIS;
 
         // Forgetting it would put the item back in a folder that is not there.
-        assert_eq!(tidied(&own, &[source("b", &in_folder, 0)], later), own);
-        let forgotten = tidied(&own, &[source("b", &in_none, 0)], later);
+        assert_eq!(tidied(&own, &[source("b", &in_folder)], later), own);
+        let forgotten = tidied(&own, &[source("b", &in_none)], later);
         assert!(forgotten.is_empty());
         // An item in the file of the device itself counts as well.
         let mut with_item = own.clone();
         let in_own_file = version(1, "a", json!({"id": "2", "folderId": "f"}));
         with_item.insert("cipher:2".to_owned(), in_own_file);
         assert_eq!(tidied(&with_item, &[], later), with_item);
-    }
-
-    #[test]
-    fn a_vault_of_the_earlier_layout_is_taken_over_as_it_is_put_together() {
-        // A client that knows only the earlier layout changed the first two items after a device
-        // took the vault over, without changing their revision dates.
-        let earlier = versions(vec![
-            ("cipher:1", version(5, "", json!({"id": "1", "v": "new"}))),
-            ("cipher:2", version(5, "", json!({"id": "2", "v": "new"}))),
-            ("cipher:3", version(5, "", json!({"id": "3"}))),
-            ("cipher:4", version(5, "", json!({"id": "4"}))),
-        ]);
-        let old = version(5, "", json!({"id": "1", "v": "old"}));
-        let own = versions(vec![("cipher:1", old)]);
-        let other_file = versions(vec![
-            ("cipher:2", version(5, "", json!({"id": "2", "v": "old"}))),
-            ("cipher:3", version(5, "", json!({"id": "3"}))),
-            ("cipher:4", version(6, "b", json!({"id": "4", "v": "b"}))),
-        ]);
-        let mut taken_over = own.clone();
-
-        let others = [source("b", &other_file, 0)];
-        take_over(&mut taken_over, &earlier, &others, 1_000, "a");
-
-        // Where a file has another version that is as new, it is stamped anew.
-        let anew = |id: &str| version(1_000, "a", json!({"id": id, "v": "new"}));
-        assert_eq!(taken_over.get("cipher:1"), Some(&anew("1")));
-        assert_eq!(taken_over.get("cipher:2"), Some(&anew("2")));
-        assert_eq!(taken_over.get("cipher:3"), earlier.get("cipher:3"));
-        assert_eq!(taken_over.get("cipher:4"), earlier.get("cipher:4"));
-        // The vault stays the same once the vault of the earlier layout is gone.
-        let before = merge([&earlier, &own, &other_file]);
-        let after = merge([&taken_over, &other_file]);
-        for key in ["cipher:1", "cipher:2", "cipher:3", "cipher:4"] {
-            assert_eq!(
-                after.get(key).unwrap().record,
-                before.get(key).unwrap().record,
-                "{key}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_vault_of_the_earlier_layout_that_is_written_again_keeps_what_the_devices_wrote() {
-        // A device took over a vault with three items, and since changed the master password and
-        // the last item. A client that knows only that layout wrote the vault again later, as it
-        // had it, without those items and with a new one.
-        let taken_over = |value: &str| version(1, "", json!({"v": value}));
-        let device = versions(vec![
-            ("account", taken_over("account")),
-            ("masterPassword", version(3, "a", json!({"v": "new"}))),
-            ("cipher:1", taken_over("1")),
-            ("folder:2", taken_over("2")),
-            ("cipher:3", version(3, "a", json!({"v": "changed"}))),
-        ]);
-        let account = version(5, "", json!({"v": "account"}));
-        let mut earlier = versions(vec![
-            ("account", account.clone()),
-            ("masterPassword", version(5, "", json!({"v": "old"}))),
-            ("cipher:4", version(5, "", json!({"v": "4"}))),
-        ]);
-
-        after_take_over(&mut earlier, &[source("a", &device, 0)], 5);
-
-        // Its master password is older than that of the device, whatever its revision date says,
-        // and what the device took over and it no longer has, it deleted. What the device changed
-        // stays.
-        assert_eq!(earlier.get("masterPassword"), None);
-        assert_eq!(earlier.get("account"), Some(&account));
-        assert_eq!(earlier.get("cipher:1"), Some(&deletion(5, "")));
-        assert_eq!(earlier.get("folder:2"), Some(&deletion(5, "")));
-        assert_eq!(earlier.get("cipher:3"), None);
-        let merged = merge([&earlier, &device]);
-        let record = |key: &str| merged.get(key).and_then(|version| version.record.clone());
-        let with = |value: &str| Some(into_object(json!({"v": value})));
-        assert_eq!(record("masterPassword"), with("new"));
-        assert_eq!(record("cipher:1"), None);
-        assert_eq!(record("cipher:3"), with("changed"));
-        assert_eq!(record("cipher:4"), with("4"));
     }
 }

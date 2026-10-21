@@ -13,10 +13,6 @@ use serde_json::{Value, json};
 
 const OTHER_DEVICE: &str = "device-b";
 
-const FIXTURE: &str = include_str!("fixtures/android-vault.json");
-const FIXTURE_ID: &str = "11111111-2222-4333-8444-555555555555";
-const FIXTURE_EMAIL: &str = "android@example.com";
-const FIXTURE_HASH: &str = "YW5kcm9pZC1oYXNo";
 const NEW_HASH: &str = "bmV3LWhhc2g=";
 
 /// Two devices, each with its own copy of the vault folder.
@@ -367,164 +363,38 @@ fn a_device_writes_only_its_own_files() {
 }
 
 #[test]
-fn a_vault_of_the_earlier_layout_that_two_devices_take_over_comes_together() {
+fn the_email_of_an_account_of_which_only_the_vault_json_has_come_is_not_taken_to_be_free() {
     let devices = Devices::new();
-    for fs in [&devices.a_fs, &devices.b_fs] {
-        fs.put(&[FIXTURE_ID, "vault.json"], FIXTURE);
+    // The account has other KDF settings than the ones that an email without an account gets.
+    let mut registered = registration(EMAIL, PASSWORD_HASH);
+    for data in ["masterPasswordAuthentication", "masterPasswordUnlock"] {
+        registered[data]["kdf"]["iterations"] = json!(700_000);
     }
-    let login = body(&devices.a.log_in(FIXTURE_EMAIL, FIXTURE_HASH));
-    let token = login["access_token"].as_str().unwrap().to_owned();
+    let path = "accounts/register/finish";
+    assert_eq!(devices.a.send_anonymous("POST", path, registered).code, 200);
+    let user_id = logged_in_id(&body(&devices.a.log_in(EMAIL, PASSWORD_HASH)));
 
-    let folder = json!({"name": "2.folder"});
-    devices.a.send("POST", "folders", &token, folder);
-    let item = create_cipher(&devices.b, &token, "2.item");
-    devices.sync_files();
-
-    let vault = sync(&devices.a, &token);
-    assert_eq!(vault, sync(&devices.b, &token));
-    assert_eq!(names(&vault["folders"]), ["2.folder"]);
-    let fixture: Value = serde_json::from_str(FIXTURE).unwrap();
-    let mut ciphers = fixture["sync"]["ciphers"].as_array().unwrap().clone();
-    ciphers.push(item.clone());
-    assert_eq!(vault["ciphers"], Value::Array(ciphers));
-
-    // Both devices hold the whole vault that they took over. Once each has the file of the
-    // other, and every device has had time to get the file of the first one, the one whose ID
-    // comes later leaves it to the other one, and holds only its change.
-    devices.sync_files();
-    let records = |fs: &MemoryFileSystem, device_id: &str| {
-        let file = read_json(fs, &device_file(FIXTURE_ID, device_id));
-        let keys = file["records"].as_object().unwrap().keys();
-        keys.cloned().collect::<Vec<String>>()
-    };
-    // The record of the account, that of its master password and the two items.
-    assert_eq!(records(&devices.b_fs, OTHER_DEVICE).len(), 5);
-    devices.b.platform.set_now(NOON + GRACE);
-    sync(&devices.b, &token);
-    devices.sync_files();
-    assert_eq!(records(&devices.b_fs, OTHER_DEVICE), [cipher_key(&item)]);
-    assert_eq!(records(&devices.a_fs, DEVICE).len(), 5);
-    assert_eq!(sync(&devices.a, &token), vault);
-}
-
-#[test]
-fn a_vault_of_the_earlier_layout_that_is_written_again_keeps_what_a_device_changed_since() {
-    let devices = Devices::new();
-    devices.a_fs.put(&[FIXTURE_ID, "vault.json"], FIXTURE);
-    let login = body(&devices.a.log_in(FIXTURE_EMAIL, FIXTURE_HASH));
-    let token = login["access_token"].as_str().unwrap().to_owned();
-    // The first device takes the vault over with a change of the master password.
-    let changed = change_password_of(&devices.a, &token, FIXTURE_EMAIL, FIXTURE_HASH);
-    assert_eq!(changed.code, 200);
-
-    // A client that knows only the earlier layout, which the `vault.json` of this layout has not
-    // come to, deletes the first item a minute later, and the tool that syncs the folder keeps its
-    // `vault.json`. It still has the master password from before the change.
-    let mut earlier: Value = serde_json::from_str(FIXTURE).unwrap();
-    let ciphers = earlier["sync"]["ciphers"].as_array_mut().unwrap();
-    let deleted = ciphers.remove(0);
-    earlier["revisionDate"] = json!("2026-10-11T12:01:00.000Z");
-    let written_again = earlier.to_string();
-    devices.a_fs.put(&[FIXTURE_ID, "vault.json"], written_again);
-    deliver(&devices.a_fs, DEVICE, &devices.b_fs);
-
-    // Every device keeps the master password that the first one wrote, and the deletion.
-    let kept = json!([earlier["sync"]["ciphers"][0]]);
-    for client in devices.clients() {
-        assert_eq!(client.log_in(FIXTURE_EMAIL, FIXTURE_HASH).code, 400);
-        assert_eq!(client.log_in(FIXTURE_EMAIL, NEW_HASH).code, 200);
-        let vault = sync(client, &token);
-        assert_eq!(vault["profile"]["key"], "2.newUserKey");
-        assert_eq!(vault["ciphers"], kept);
-    }
-    // So does the first device once it took the vault over again.
-    let folder = json!({"name": "2.folder"});
-    assert_eq!(devices.a.send("POST", "folders", &token, folder).code, 200);
-    let root = read_json(&devices.a_fs, &[FIXTURE_ID, "vault.json"]);
-    let marker = json!({"format": "bitwarden-local-vault", "version": 2});
-    assert_eq!(root, marker);
-    assert_eq!(devices.a.log_in(FIXTURE_EMAIL, NEW_HASH).code, 200);
-    assert_eq!(sync(&devices.a, &token)["ciphers"], kept);
-    assert_ne!(kept[0]["id"], deleted["id"]);
-}
-
-#[test]
-fn an_account_whose_vault_was_taken_over_is_not_logged_out_before_the_file_has_come() {
-    let devices = Devices::new();
-    for fs in [&devices.a_fs, &devices.b_fs] {
-        fs.put(&[FIXTURE_ID, "vault.json"], FIXTURE);
-    }
-    let login = body(&devices.b.log_in(FIXTURE_EMAIL, FIXTURE_HASH));
-    let token = login["access_token"].as_str().unwrap().to_owned();
-    let refresh_token = login["refresh_token"].as_str().unwrap().to_owned();
-    let folder = json!({"name": "2.folder"});
-    assert_eq!(devices.a.send("POST", "folders", &token, folder).code, 200);
-
-    // Of what the first device wrote, only the `vault.json` of the account, which now says that
-    // it has this layout, has come to the other device.
-    let marker = devices.a_fs.get(&[FIXTURE_ID, "vault.json"]).unwrap();
-    devices.b_fs.put(&[FIXTURE_ID, "vault.json"], marker);
-    let refresh = [
-        ("grant_type", "refresh_token"),
-        ("refresh_token", refresh_token.as_str()),
-    ];
-    let synced = devices.b.request("GET", "sync").token(&token).try_send();
-    let refreshed = devices
-        .b
-        .request("POST", "connect/token")
-        .form(&refresh)
-        .try_send();
-
-    // Neither is refused, which would log the account out: both fail as requests that did not
-    // reach the server, until the file of the first device has come.
-    assert!(synced.is_err());
-    assert!(refreshed.is_err());
-    devices.sync_files();
-    assert_eq!(names(&sync(&devices.b, &token)["folders"]), ["2.folder"]);
-    let refreshed = devices
-        .b
-        .request("POST", "connect/token")
-        .form(&refresh)
-        .send();
-    assert_eq!(refreshed.code, 200);
-}
-
-#[test]
-fn the_email_of_an_account_whose_vault_is_on_its_way_is_not_taken_to_have_no_account() {
-    let devices = Devices::new();
-    let mut fixture: Value = serde_json::from_str(FIXTURE).unwrap();
-    let unlock = &mut fixture["sync"]["userDecryption"]["masterPasswordUnlock"];
-    unlock["kdf"]["iterations"] = json!(700_000);
-    for fs in [&devices.a_fs, &devices.b_fs] {
-        fs.put(&[FIXTURE_ID, "vault.json"], fixture.to_string());
-    }
-    let login = body(&devices.a.log_in(FIXTURE_EMAIL, FIXTURE_HASH));
-    let token = login["access_token"].as_str().unwrap().to_owned();
-    let folder = json!({"name": "2.folder"});
-    assert_eq!(devices.a.send("POST", "folders", &token, folder).code, 200);
-
-    // Of what the first device wrote, only the `vault.json` of the account has come to the
-    // other device.
-    let marker = devices.a_fs.get(&[FIXTURE_ID, "vault.json"]).unwrap();
-    devices.b_fs.put(&[FIXTURE_ID, "vault.json"], marker);
-    let email = json!({"email": FIXTURE_EMAIL});
+    // Of what the first device wrote, only the `vault.json` of the account has come to the other
+    // device.
+    let root = [user_id.as_str(), "vault.json"];
+    devices.b_fs.put(&root, devices.a_fs.get(&root).unwrap());
+    let email = json!({"email": EMAIL});
     let prelogin = || {
         let request = devices.b.request("POST", "accounts/prelogin");
         request.json(email.clone()).try_send()
     };
     let form = [
         ("grant_type", "password"),
-        ("username", FIXTURE_EMAIL),
-        ("password", FIXTURE_HASH),
+        ("username", EMAIL),
+        ("password", PASSWORD_HASH),
     ];
     let logged_in = devices
         .b
         .request("POST", "connect/token")
         .form(&form)
         .try_send();
-    let registration = registration(FIXTURE_EMAIL, PASSWORD_HASH);
-    let register = devices.b.request("POST", "accounts/register/finish");
-    let registered = register.json(registration).try_send();
+    let register = devices.b.request("POST", path);
+    let registered = register.json(registration(EMAIL, PASSWORD_HASH)).try_send();
 
     // The client is not told how the master key of an account that does not have the email is
     // derived, that the master password is wrong, or that the email is free: each fails as a
@@ -532,16 +402,10 @@ fn the_email_of_an_account_whose_vault_is_on_its_way_is_not_taken_to_have_no_acc
     assert!(prelogin().is_err());
     assert!(logged_in.is_err());
     assert!(registered.is_err());
-    assert!(
-        devices
-            .b_fs
-            .paths()
-            .iter()
-            .all(|path| path[0] == FIXTURE_ID)
-    );
+    assert_eq!(devices.b_fs.paths(), [root]);
     devices.sync_files();
     assert_eq!(body(&prelogin().unwrap())["kdfIterations"], 700_000);
-    assert_eq!(devices.b.log_in(FIXTURE_EMAIL, FIXTURE_HASH).code, 200);
+    assert_eq!(devices.b.log_in(EMAIL, PASSWORD_HASH).code, 200);
 }
 
 #[test]

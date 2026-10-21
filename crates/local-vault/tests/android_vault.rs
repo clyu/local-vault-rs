@@ -1,6 +1,7 @@
-//! A vault as the Android app wrote it before the local vault was shared: the fixture has the
-//! structure of a vault that the app created, with every value replaced. These tests keep the
-//! vaults that the earlier implementations wrote readable.
+//! A vault as the Android app wrote it before the local vault was shared, in the file of the
+//! device that took it over: the fixture is what the local vault wrote when it took over a vault
+//! with the structure of one that the app created, with every value replaced. The vaults that the
+//! earlier implementations wrote are in such files now, which these tests keep readable.
 //!
 //! The app that created it stored `encryptedFor` with an item, which the app has stopped since.
 //! The items of the fixture are without it, as the app writes them now.
@@ -17,15 +18,17 @@ const FIXTURE: &str = include_str!("fixtures/android-vault.json");
 const USER_ID: &str = "11111111-2222-4333-8444-555555555555";
 const ANDROID_EMAIL: &str = "android@example.com";
 const ANDROID_HASH: &str = "YW5kcm9pZC1oYXNo";
-const VAULT_FILE: [&str; 2] = [USER_ID, "vault.json"];
 
 fn fixture() -> Value {
     serde_json::from_str(FIXTURE).unwrap()
 }
 
-fn client_with(vault: &str) -> (Client<MemoryFileSystem>, MemoryFileSystem) {
+/// A client whose device has the file, as the device that took the vault over has.
+fn client_with(file: &str) -> (Client<MemoryFileSystem>, MemoryFileSystem) {
     let (client, fs) = Client::in_memory(ClientKind::Browser);
-    fs.put(&VAULT_FILE, vault);
+    let marker = json!({"format": "bitwarden-local-vault", "version": 2});
+    fs.put(&[USER_ID, "vault.json"], marker.to_string());
+    fs.put(&device_file(USER_ID, DEVICE), file);
     (client, fs)
 }
 
@@ -80,7 +83,6 @@ fn nothing_changes_but_what_a_request_is_about() {
     let (client, fs) = client_with(FIXTURE);
     let fixture = fixture();
     let token = log_in(&client);
-    let login = &fixture["sync"]["ciphers"][0];
     let note = &fixture["sync"]["ciphers"][1];
     let update = json!({
         "type": 2,
@@ -99,43 +101,20 @@ fn nothing_changes_but_what_a_request_is_about() {
     let updated = client.send("PUT", &path, &token, update);
 
     assert_eq!(updated.code, 200);
-    // The device that writes first takes the vault over, and the earlier layout is left with
-    // only the marker of this one, which the earlier clients leave alone.
-    let marker = json!({"format": "bitwarden-local-vault", "version": 2});
-    assert_eq!(read_json(&fs, &VAULT_FILE), marker);
-    let written = read_json(&fs, &device_file(USER_ID, DEVICE));
-    assert_eq!(written["revisionDate"], "2026-10-11T12:00:00.000Z");
-    let without_sync = |vault: &Value| {
-        let mut vault = vault.clone();
-        for key in [
-            "sync",
-            "revisionDate",
-            "version",
-            "since",
-            "records",
-            "tombstones",
-            "removedAttachments",
-        ] {
-            vault[key] = Value::Null;
-        }
-        vault
-    };
-    assert_eq!(without_sync(&written), without_sync(&fixture));
-    let without_ciphers = |vault: &Value| {
-        let mut sync = vault["sync"].clone();
-        sync["ciphers"] = Value::Null;
-        sync
-    };
-    assert_eq!(without_ciphers(&written), without_ciphers(&fixture));
-    assert_eq!(&written["sync"]["ciphers"][0], login);
+    // The file of the device has a new version of the item, and is otherwise as it was: what the
+    // device took over keeps the stamps that it was taken over with. Only `since`, which earlier
+    // clients wrote, is left out.
     let mut renamed = note.clone();
     renamed["name"] = json!("2.renamed");
     renamed["favorite"] = json!(true);
     renamed["revisionDate"] = json!("2026-10-11T12:00:00.000Z");
-    assert_eq!(written["sync"]["ciphers"][1], renamed);
-    // The vault of the earlier layout is not kept as the backup of `vault.json`: it is in the
-    // file of the device.
-    assert_eq!(fs.get(&[USER_ID, "vault.json.bak"]), None);
+    let mut expected = fixture.clone();
+    expected["revisionDate"] = json!("2026-10-11T12:00:00.000Z");
+    expected["sync"]["ciphers"][1] = renamed;
+    let key = format!("cipher:{}", note["id"].as_str().unwrap().to_lowercase());
+    expected["records"][&key] = json!({"at": NOON, "by": DEVICE});
+    expected.as_object_mut().unwrap().shift_remove("since");
+    assert_eq!(read_json(&fs, &device_file(USER_ID, DEVICE)), expected);
 }
 
 #[test]

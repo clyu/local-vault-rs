@@ -76,12 +76,11 @@ The `vault.json` of an account only says that its directory has this layout:
 }
 ```
 
-A client that knows only version 1, in which this file held the whole vault, does not write an
-account with this file, but does not have it either: see [The earlier layout](#the-earlier-layout),
-which says as well how a vault of version 1 is taken over. The file is written by the device that
-the account first has a file of: the one that registers the account, or that takes a vault of
-version 1 over (see [Changing a vault](#changing-a-vault)). Every device writes the same content,
-so two devices that write it at once write the same file.
+In version 1 of this layout, this file held the whole vault (see
+[The earlier layout](#the-earlier-layout)). The file is written by the device that the account
+first has a file of, which is the one that registers the account (see
+[Changing a vault](#changing-a-vault)). Every device writes the same content, so two devices that
+write it at once write the same file.
 
 The `vault.json` of an account that was deleted only says that:
 
@@ -102,7 +101,6 @@ it takes it for a layout that it does not know, which it does not use or write.
   "format": "bitwarden-local-vault",
   "version": 2,
   "revisionDate": "2026-10-11T12:00:00.000Z",
-  "since": 1791720000000,
   "account": {
     "masterPasswordVerifier": {
       "algorithm": "PBKDF2-SHA256",
@@ -131,7 +129,7 @@ it takes it for a layout that it does not know, which it does not use or write.
 | `format` | Always `bitwarden-local-vault`. A file with another value is not a vault. |
 | `version` | The version of this layout, `2`. A file with a version that a client does not know must be left alone. |
 | `revisionDate` | When the device last changed the vault, as an ISO-8601 date in UTC. |
-| `since` | When the device first wrote the file, in milliseconds since the epoch. A file without it is taken to have been written just now, and is given the current time when it is written again. |
+| `since` | Earlier clients wrote when the device first wrote the file. Nothing reads it, and it is left out when the file is written again. |
 | `account` | What a server keeps to itself about the account. |
 | `sync` | The vault, in the shape that every Bitwarden client already reads, as far as the device holds it. |
 | `records` | The stamp of every record that the file holds. |
@@ -160,11 +158,8 @@ A file holds the versions of the records that its device wrote and that it does 
 another device yet, and the deletions of other devices that it put in place of such versions (see
 [What a device no longer has to hold](#what-a-device-no-longer-has-to-hold)). The record of the
 account is only in it if `records` has a stamp for `account`, and that of the master password if
-`records` has a stamp for `masterPassword`. A file that has a stamp for `account` but none for
-`masterPassword`, and any of the fields of the master password, was written before the master
-password was a record of its own: it holds the master password, with the stamp of the account.
-The folders and the items are in `sync.folders` and `sync.ciphers`. A deletion holds no record,
-only its stamp in `tombstones`.
+`records` has a stamp for `masterPassword`. The folders and the items are in `sync.folders` and
+`sync.ciphers`. A deletion holds no record, only its stamp in `tombstones`.
 
 A stamp says when a version was written, in milliseconds since the epoch (`at`), and by which
 device (`by`). Of two versions of a record, the one with the later `at` is the newer one, and of
@@ -179,7 +174,7 @@ does not know must be kept when the file is written back. How the JSON is read a
 
 - A byte order mark at the start of a file is left out, and bytes that are not UTF-8 are read as
   U+FFFD. A file is complete if what remains is a JSON document.
-- An integer, such as `version`, `since`, `at`, the `kdf` parameters or `iterations`, is a number
+- An integer, such as `version`, `at`, the `kdf` parameters or `iterations`, is a number
   written as an integer: `1` is one, but `1.0`, `1e0` and the string `"1"` are not.
 - A number in a field that a client does not know is written back with the digits that it was read
   with: `1.0` stays `1.0`, and an integer beyond 2^53 is not rounded. An exponent may be written
@@ -229,20 +224,24 @@ at least as much as deriving the master key.
 The vault of an account is put together from all of its files, the same way on every device:
 
 1. Read `vault.json` of the account, or `vault.json.tmp` if it is missing or not complete JSON,
-   and `vault.json.bak` if that one is no good either. A vault of version 1 is one more file to
-   read (see [The earlier layout](#the-earlier-layout)), and one of version 2 only says that the
-   account has this layout. One that says that the account was deleted means that the account
-   is not there, and nothing else of it is read.
-2. Read the file of every device in the same way, in the order of the IDs of the devices,
-   compared as strings by their UTF-16 code units. The order that a directory is listed in is
-   not to be relied on. A directory without a complete file is skipped.
+   but not `vault.json.bak`, which can hold a vault of the earlier layout (see
+   [The earlier layout](#the-earlier-layout)). One of version 2 only says that the account has
+   this layout. One that says that the account was deleted means that the account is not there,
+   and nothing else of it is read.
+2. Read the file of every device, which is `vault.json` of the directory of the device, or
+   `vault.json.tmp` if it is missing or not complete JSON, and `vault.json.bak` if that one is no
+   good either, in the order of the IDs of the devices, compared as strings by their UTF-16 code
+   units. The order that a directory is listed in is not to be relied on. A directory without a
+   complete file is skipped.
 3. If the first complete file of `vault.json` of the account or of a device has a `format` or a
    `version` that the client does not know, the client has no vault to use or to change, and
    must not go on to the next file of that directory, which holds an older one: a newer client
    wrote it. It must not take the account to be gone either, but treat it as an account whose
-   files are on their way (see below) until the client is updated. Only a `vault.json` of the
-   account whose `format` is not `bitwarden-local-vault`, such as the one that says that the
-   account was deleted, means that there is no account.
+   files are on their way (see below) until the client is updated. A `vault.json` of the account
+   of version 1 is treated the same way, as no device took it over (see
+   [The earlier layout](#the-earlier-layout)). Only a `vault.json` of the account whose `format`
+   is not `bitwarden-local-vault`, such as the one that says that the account was deleted, means
+   that there is no account.
 4. Take the newest version of each record, and of versions that are as new, the first one that
    was read. A record whose newest version is a deletion is not in the vault.
 5. The vault is the record of the account, with the fields of the record of the master password
@@ -260,8 +259,8 @@ The vault of an account is put together from all of its files, the same way on e
 Every device that has the same files comes to the same vault.
 
 A tool that syncs the folder does not bring the files of an account all at once, nor in the order
-that they were written. The `vault.json` of an account that another device took over can come
-before the file of that device, and the file of a device that left the master password out (see
+that they were written. The `vault.json` of an account can come before the file of the device
+that registered the account, and the file of a device that left the master password out (see
 [What a device no longer has to hold](#what-a-device-no-longer-has-to-hold)) before the file of
 the device that holds the newer one, and the files of the devices before the `vault.json` of the
 account. A device that has the `vault.json` of this layout, or the file of a device, but no file
@@ -289,16 +288,15 @@ A client that changes a vault writes the file of its own device, and no other:
    is thus newer than that one, even where the clock of its device is behind.
 3. Read the files of the devices again, as the file of another device may have come in since.
    The new file of the device is the versions that it holds, with the new ones in place of those
-   of the same records, without what it no longer has to hold (see below), with `revisionDate`
-   set to the current time, and with the `since` of the file that it replaces, or the current
-   time if there is none. Its `removedAttachments` are those of the file that it replaces, with
-   every attachment that the change took out of the vault added at the current time: one that an
-   item no longer has, and those of an item that was deleted.
+   of the same records, without what it no longer has to hold (see below), and with
+   `revisionDate` set to the current time. Its `removedAttachments` are those of the file that it
+   replaces, with every attachment that the change took out of the vault added at the current
+   time: one that an item no longer has, and those of an item that was deleted.
 4. Write the new file to `vault.json.tmp` of the directory of the device, delete
    `vault.json.bak`, rename `vault.json` to `vault.json.bak`, and rename `vault.json.tmp` to
    `vault.json`.
 5. If `vault.json` of the account does not say that it has this layout yet, write it the same
-   way, but only if the vault was of the earlier layout, or if no other device has a file of the
+   way, but only if no other device has a file of the account, as when the device registers the
    account: the file of the device then holds the records of the account. Otherwise that
    `vault.json` is on its way to the device, from the device that the account first had a file
    of, if that one could write it. Written by the device, it could be written as the account is
@@ -312,9 +310,6 @@ A client that changes a vault writes the file of its own device, and no other:
    its devices hold its records, but a device that has none of those files yet takes the account
    to be not there, as it does before any file of the account has come, rather than on its way
    (see [Putting the vault together](#putting-the-vault-together)).
-6. If the vault was of the earlier layout and `vault.json` now says that the account has this
-   layout, delete `vault.json.bak` of the account, which holds the vault of the earlier layout
-   (see [The earlier layout](#the-earlier-layout)).
 
 An item is only replaced if its `revisionDate` in the vault is the one that the client last saw,
 give or take a second. Otherwise somebody else changed it in the meantime, and the client has to
@@ -371,18 +366,12 @@ while it is still there.
 ### What a device no longer has to hold
 
 A file can take up to 90 days to come to every device that shares the folder, as a device can be
-off for a while. A version has been in the file of a device for 90 days once its `at` and the
-`since` of the file are both 90 days old or older; a version that a device took over from a vault
-of the earlier layout was written long before the file. A device leaves out of its file, when it
-writes it:
+off for a while, so a version has come to every device once its `at` is 90 days old or older. A
+device leaves out of its file, when it writes it:
 
 - A version of a record that the file of another device has a newer version of, once that one
-  has been in that file for 90 days. If the newer one is a version of the record of the master
-  password, it does so right away: see below.
-- A version of a record that the file of a device whose ID comes before its own has as well,
-  with the same stamp and the same record, as two devices that took over the same vault of the
-  earlier layout have, or two that hold the same deletion, once it has been in that file for 90
-  days. Of the devices that hold the same version, the first one keeps it.
+  has come to every device. If the newer one is a version of the record of the master password,
+  it does so right away: see below.
 - A deletion that is 90 days old or older, if no file of another device has the record in a
   version with an earlier stamp, which forgetting the deletion would bring back. The 90 days are
   for a file with such a version that is still on its way: if it comes after the deletion is
@@ -447,63 +436,27 @@ such a file behind, and that directory then has to be deleted by hand.
 ## The earlier layout
 
 In version 1 of this layout, the `vault.json` of an account held the whole vault, in the form of
-the file of a device without `records`, `tombstones` and `removedAttachments`. A client reads such
-a vault as one more file, before those of the devices. Its folders and items are taken to have
-been written at their `revisionDate`, and the records of the account and of its master password
-at the `revisionDate` of the vault, all by no device (`""`).
+the file of a device without `records`, `tombstones` and `removedAttachments`. The first device
+that changed such a vault took all of it into its own file, and wrote the `vault.json` of version
+2 in its place. The versions that it took over have no device in their stamps (`""`): a folder or
+an item was taken to have been written at its `revisionDate`, and the records of the account and
+of its master password at the `revisionDate` of the vault. They stay in the file of the device
+until it no longer has to hold them, as any other version (see
+[What a device no longer has to hold](#what-a-device-no-longer-has-to-hold)).
 
-A client that knows only version 1 can write such a vault again after a device took it over, as
-long as the `vault.json` of this version has not come to it, and a tool that syncs the folder can
-keep that vault in place of the `vault.json` of this version. That client does not see what the
-devices changed since, and it writes the whole vault for any change, with a new `revisionDate`.
-So, along with the files of the devices:
+A vault of version 1 is not read anymore. An account whose `vault.json` still is one has no vault
+to use or to change, but is not taken to be gone either (see
+[Putting the vault together](#putting-the-vault-together)), until a client that still reads that
+layout takes it over.
 
-- Its record of the account, or that of its master password, is not taken if the file of a
-  device has a version of that record that a device wrote, whose `by` is not `""`. That version
-  is newer than what the client of version 1 holds, whatever the `revisionDate` of the vault
-  says: otherwise, any change on that client would bring back the master password from before a
-  change on a device. A change of the master password on that client is then lost.
-- A folder or an item that the file of a device has in the version that a device took over, whose
-  `by` is `""`, and that the vault of version 1 does not have, was deleted by that client: the
-  vault of version 1 is taken to hold a deletion of it, at its `revisionDate`, by no device. One
-  that the file of a device has in a version that a device wrote is kept, as the vault does not
-  say when it was deleted.
+Writing the `vault.json` of version 2 in its place left the vault of version 1 in
+`vault.json.bak` of the account, which earlier clients deleted when they synced. That file is not
+read either. The `vault.json` of this version is never replaced again, so a backup that is still
+there keeps the user key encrypted with the master password of that time for good, after a change
+of the master password as well, until it is deleted by hand.
 
-A vault of version 1 that nobody wrote again since a device took it over comes to the same vault
-either way: the devices took over every version of it, and only wrote newer ones.
-
-The first device that changes the vault takes all of it into its own file, and then writes
-`vault.json` of the account as in this version, which leaves the vault of version 1 in
-`vault.json.bak`. A version of the vault of version 1 is taken unless the file of the device
-already has a newer one. If the file of a device, its own included, has another version of the
-record with the same stamp, and no file has a newer one, the version of the vault of version 1 is
-the one in the vault, as it is read first. It is then taken with a new stamp, as in
-[Changing a vault](#changing-a-vault), so that it stays the one in the vault once the vault of
-version 1 is gone. That is the case when a client that knows only version 1 changes an item in a
-way that keeps its `revisionDate` after a device took the vault over, as the `vault.json` of this
-version has not come to it yet.
-
-The device then deletes that `vault.json.bak`. The vault is in the files of the devices by then,
-and the `vault.json` of this version is never replaced again, so the backup would keep the user
-key encrypted with the master password of that time for good, after a change of the master
-password as well. Read in place of a `vault.json` that is not complete, it would also bring back
-what was deleted since. A device that finds `vault.json.bak` next to the `vault.json` of this
-version deletes it when its client syncs, at most once a day, as a device that took the vault
-over can be interrupted before it deletes it, or be a client from before it was deleted.
-
-Once the `vault.json` of this version has come to it, a client that knows only version 1 does not
-write the account, until it is updated, but it does not have the account either. It refuses the
-requests of the account as unauthorized, which logs the account out. It takes the email of the
-account to belong to no account, so the master key is derived with the default KDF parameters and
-the master password is taken to be wrong. And it lets the email be registered again, which leaves
-two accounts with it, of which an updated client can log in to the new one (see
-[Accounts with the same email address](#accounts-with-the-same-email-address)). Clients that
-share a vault folder are therefore updated to this version together.
-
-Two devices that take a vault over at once each take all of it, and come to the same vault, as
-they hold the same versions of it. Once each has the file of the other, and the file of the one
-whose ID comes first has been there for 90 days, the one whose ID comes later leaves those
-versions to the other one.
+Two devices that took a vault over at once each took all of it, and each holds the same versions
+of it until a newer version of the record replaces them.
 
 ## Accounts with the same email address
 
