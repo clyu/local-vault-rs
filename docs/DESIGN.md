@@ -185,9 +185,10 @@ device. It is the only code that knows the file layout, and it guarantees five t
 A device leaves out of its file what it no longer has to hold: a version that another device has
 a newer one of, or the same one if the ID of that device comes first, and a deletion that is old
 enough and that nothing could bring back anymore. The deletion of a folder is kept while a file
-has an item in the folder, which would otherwise be in a folder that is not there. It
-does this when it writes its file, and when its client syncs, once a day at most, and again at
-the next sync if it could not, as it is also what leaves an older master password out.
+has an item in the folder, which would otherwise be in a folder that is not there. A version of a
+record that another device deleted since is replaced by that deletion. A device does this when it
+writes its file, and when its client syncs, once a day at most, and again at the next sync if it
+could not, as it is also what leaves an older master password out.
 
 A tool that syncs the folder brings the files of an account in no particular order, so a third
 device can get the file that leaves a version out before the file with the newer one. A device
@@ -195,10 +196,13 @@ therefore holds a version until the newer one has been in the file of the other 
 days, the time that the format allows a file to take to come to every device (`GRACE_MILLIS`),
 and the third device has the record in the meantime, if not yet as it is now. Every file says
 since when it is there (`since`), as a version that a device took over from a vault of the
-earlier layout is much older than the file that holds it. Two versions are left out right away:
-one that a deletion replaced, as long as no other file has an older version of the record, which
-the third device would take for the record in the meantime, and one of the master password, as
-its older versions hold what a change of the master password replaced.
+earlier layout is much older than the file that holds it. One version is left out right away:
+one of the master password, as its older versions hold what a change of the master password
+replaced. A version that a deletion replaced is replaced by that deletion right away, rather than
+left out: the device that deleted the record put the deletion in place of the version that it
+held, so a third device that gets the file without the version before the file with the deletion
+can still have the file of that device from before, with an older version, which it would take
+for the record.
 
 The content of an attachment is a file that every device shares, not a version, and a device
 that had not seen the removal of an attachment can bring it back with a change of the item that

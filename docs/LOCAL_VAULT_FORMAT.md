@@ -157,7 +157,7 @@ records of their own. A record has a key: `masterPassword`, `account`, `folder:<
 `cipher:<id>`, with the ID in lower case.
 
 A file holds the versions of the records that its device wrote and that it does not leave to
-another device yet (see
+another device yet, and the deletions of other devices that it put in place of such versions (see
 [What a device no longer has to hold](#what-a-device-no-longer-has-to-hold)). The record of the
 account is only in it if `records` has a stamp for `account`, and that of the master password if
 `records` has a stamp for `masterPassword`. A file that has a stamp for `account` but none for
@@ -378,18 +378,22 @@ writes it:
 
 - A version of a record that the file of another device has a newer version of, once that one
   has been in that file for 90 days. If the newer one is a version of the record of the master
-  password, or a deletion and no file of another device has an older version of the record, it
-  does so right away: see below.
+  password, it does so right away: see below.
 - A version of a record that the file of a device whose ID comes before its own has as well,
   with the same stamp and the same record, as two devices that took over the same vault of the
-  earlier layout have, once it has been in that file for 90 days. Of the devices that hold the
-  same version, the first one keeps it.
+  earlier layout have, or two that hold the same deletion, once it has been in that file for 90
+  days. Of the devices that hold the same version, the first one keeps it.
 - A deletion that is 90 days old or older, if no file of another device has the record in a
   version with an earlier stamp, which forgetting the deletion would bring back. The 90 days are
   for a file with such a version that is still on its way: if it comes after the deletion is
   forgotten, the record is back. The deletion of a folder is kept as well while a file, its own
   included, has an item whose `folderId` is that folder, as the item is in no folder only as long
   as the deletion is there.
+
+In place of a version of a record that the file of another device has a newer deletion of, a
+device puts that deletion in its file when it writes it, with the stamp that it has there, unless
+it leaves the version out as above. Of the deletions of several devices, it puts the newest one
+(see below).
 
 A device that does not change the vault looks for these at most once a day, when its client
 syncs, and again at the next sync if it could not, along with the content of the attachments
@@ -403,19 +407,23 @@ that other device is deleted, which is why that must not be done by hand. A thir
 the file without the version before the file with the newer one, as a tool that syncs the folder
 brings them in no particular order. The 90 days are for that: by then, the newer one has come to
 every device, and a device that gets the file without the version still has the record, as it
-was before the change or as it is now. Two versions are left out right away nonetheless:
+was before the change or as it is now. Two versions are not held that long nonetheless:
 
-- One that a deletion replaced, as long as no file of another device has an older version of the
-  record: the record is then not in the vault either way. Otherwise, a device that gets the file
-  without the version before the one with the deletion would take that older version for the
-  record, and a change of it there would bring the record back, older than it was.
-- One of the record of the master password, even where the file of another device has an older
-  version of it. Its older versions hold what a change of the master password replaced, which is
-  not kept longer than it has to be. A device that does not have the newer one yet has no vault
-  to use until it comes (see [Putting the vault together](#putting-the-vault-together)), or takes
-  an older one that another file still has, such as that of a device that is gone for good, for
-  the master password until then. An older version of the record of the account holds nothing of
-  the kind, and is left out as any other one.
+- One that a deletion replaced, which the device replaces with that deletion right away: the
+  record is not in the vault either way, and is no longer in the file. The version is not left
+  out, as the device that deleted the record put the deletion in place of the version that it
+  held. A device that gets this file before the one with the deletion can still have the file of
+  that device from before, with that older version, which it would take for the record, and a
+  change of it there would bring the record back, older than it was. With the deletion in both
+  files, it has the deletion either way.
+- One of the record of the master password, which is left out right away, even where the file of
+  another device has an older version of it. Its older versions hold what a change of the master
+  password replaced, which is not kept longer than it has to be. A device that does not have the
+  newer one yet has no vault to use until it comes (see
+  [Putting the vault together](#putting-the-vault-together)), or takes an older one that another
+  file still has, such as that of a device that is gone for good, for the master password until
+  then. An older version of the record of the account holds nothing of the kind, and is left out
+  as any other one.
 
 ## Deleting an account
 

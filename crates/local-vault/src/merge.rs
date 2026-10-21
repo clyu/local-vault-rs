@@ -6,7 +6,8 @@
 //! not long enough ago for every device to have the newer version: the record of the master
 //! password, that of the rest of the account, the folders and the items. A deletion is a version
 //! as well, one without a record, so that a record that another file still has is not taken to be
-//! there.
+//! there. A device that holds a version of a record that another device deleted since puts that
+//! deletion in its file in place of the version (see [`tidy`]).
 //!
 //! Every version has a [`Stamp`]: when it was written, and by which device. The vault is the newest
 //! version of each record. A version that is made from another one is stamped later than that one,
@@ -691,29 +692,42 @@ pub(crate) fn changes(
 }
 
 /// Leaves out of the versions of the device with the ID what it no longer has to hold, given the
-/// other files:
+/// other files, and puts the deletions that they have in place of the versions that they replaced:
 ///
-/// - a version that one of them has a newer one of, once every device has had time to get that
-///   one, or right away if the record is that of the master password, or if that one is a
-///   deletion and none of them has an older version of the record (see `is_replaced`);
+/// - a version that one of them has a newer one of is left out once every device has had time to
+///   get that one, or right away if the record is that of the master password (see
+///   `is_replaced`);
+/// - a version that one of them has a newer deletion of is replaced by that deletion right away,
+///   or by the newest one if several of them have one, unless it is left out (see
+///   `newer_deletion`);
 /// - a version that the file of a device whose ID comes before this one has as well, with the same
 ///   stamp and the same record, as two devices that took over the same vault of the earlier layout
-///   have, once every device has had time to get that file: of the devices that hold the same
-///   version, the first one keeps it;
+///   have, or two that hold the same deletion, is left out once every device has had time to get
+///   that file: of the devices that hold the same version, the first one keeps it;
 /// - a deletion that is older than [`GRACE_MILLIS`] and that none of them has an older version of
 ///   the record for, which it would bring back, nor, for a folder, an item in the folder, which
-///   would then be in a folder that is not there (see `is_forgettable`).
+///   would then be in a folder that is not there, is left out (see `is_forgettable`).
 ///
-/// Returns `true` if anything was left out. Only the device that holds a version leaves it out, as
-/// no device writes the file of another. A tool that syncs the folder can bring the file without
-/// the version to a third device before the file that it was left to, which is why the version is
-/// held until every device has had time to get that one.
+/// Returns `true` if anything was left out or replaced. Only the device that holds a version leaves
+/// it out, as no device writes the file of another. A tool that syncs the folder can bring the file
+/// without the version to a third device before the file that it was left to, which is why the
+/// version is held until every device has had time to get that one.
 pub(crate) fn tidy(
     versions: &mut Versions,
     device_id: &str,
     others: &[&Source],
     now_millis: i64,
 ) -> bool {
+    let mut is_changed = false;
+    for (key, version) in versions.iter_mut() {
+        if is_replaced(key, version, others, now_millis) {
+            continue;
+        }
+        if let Some(deletion) = newer_deletion(key, version, others) {
+            *version = deletion;
+            is_changed = true;
+        }
+    }
     let own: &Versions = versions;
     let removable: HashSet<String> = own
         .iter()
@@ -725,7 +739,7 @@ pub(crate) fn tidy(
         .map(|(key, _)| key.clone())
         .collect();
     versions.retain(|key, _| !removable.contains(key));
-    !removable.is_empty()
+    is_changed || !removable.is_empty()
 }
 
 /// Returns `true` if another file has a newer version of the record that the version can be left
@@ -733,20 +747,26 @@ pub(crate) fn tidy(
 /// password, whose older versions hold what a change of the master password replaced: a device
 /// that does not have the newer one yet has no vault to use until it comes, or takes an older one
 /// that another file still has for the master password until then.
-///
-/// A deletion is one as well, as long as none of the other files has an older version of the
-/// record: the record is then not in the vault either way. Otherwise, a device that gets this file
-/// before the one with the deletion would take that older version for the record, and a change of
-/// it there would bring the record back as it was before this version.
 fn is_replaced(key: &str, version: &Version, others: &[&Source], now_millis: i64) -> bool {
     others.iter().any(|other| {
         other.versions.get(key).is_some_and(|newer| {
             newer.stamp > version.stamp
-                && (key == MASTER_PASSWORD_KEY
-                    || (newer.record.is_none() && !is_older_held(key, version, others))
-                    || other.has_come_everywhere(newer, now_millis))
+                && (key == MASTER_PASSWORD_KEY || other.has_come_everywhere(newer, now_millis))
         })
     })
+}
+
+/// The newest deletion of the record that one of the other files has, if it is newer than the
+/// version, which it then replaces: the record is not in the vault either way, and is no longer in
+/// the file either. The version is not left out, as the device that deleted the record put the
+/// deletion in place of the version that it held. A device that gets this file before the one with
+/// the deletion can still have the file of that device from before, with that older version, which
+/// it would take for the record, and a change of it there would bring the record back, older than
+/// it was. With the deletion in this file as well, that device has the deletion either way.
+fn newer_deletion(key: &str, version: &Version, others: &[&Source]) -> Option<Version> {
+    let held = others.iter().filter_map(|other| other.versions.get(key));
+    let deletions = held.filter(|held| held.record.is_none() && held.stamp > version.stamp);
+    deletions.max_by(|a, b| a.stamp.cmp(&b.stamp)).cloned()
 }
 
 /// Returns `true` if one of the other files has a version of the record that is older than the
@@ -1220,23 +1240,20 @@ mod tests {
             ("account", version(DAY, "a", json!({"v": "a"}))),
             ("masterPassword", version(DAY, "a", json!({"v": "a"}))),
             ("cipher:1", version(DAY, "a", json!({"v": "a"}))),
-            ("cipher:2", version(DAY, "a", json!({"v": "a"}))),
             ("cipher:3", version(5 * DAY, "a", json!({"v": "a"}))),
         ]);
         let newer = versions(vec![
             ("account", version(2 * DAY, "b", json!({"v": "b"}))),
             ("masterPassword", version(2 * DAY, "b", json!({"v": "b"}))),
             ("cipher:1", version(2 * DAY, "b", json!({"v": "b"}))),
-            ("cipher:2", deletion(2 * DAY, "b")),
             ("cipher:3", version(4 * DAY, "b", json!({"v": "b"}))),
         ]);
         let others = [source("b", &newer, 0)];
         let due = 2 * DAY + GRACE_MILLIS;
         let waiting = ["account", "cipher:1", "cipher:3"];
 
-        // The master password and a deletion are left to the other device right away, and
-        // another version, that of the account as well, once every device has had time to get
-        // it.
+        // The master password is left to the other device right away, and another version, that
+        // of the account as well, once every device has had time to get it.
         assert_eq!(kept(&own, &others, 3 * DAY), waiting);
         assert_eq!(kept(&own, &others, due - 1), waiting);
         assert_eq!(kept(&own, &others, due), ["cipher:3"]);
@@ -1255,29 +1272,43 @@ mod tests {
     }
 
     #[test]
-    fn a_version_is_left_to_a_deletion_right_away_only_once_no_file_has_an_older_one() {
+    fn a_version_that_a_deletion_replaced_is_replaced_by_it_right_away() {
         let own = versions(vec![
             ("cipher:1", version(2 * DAY, "a", json!({"v": "a"}))),
+            ("cipher:2", version(6 * DAY, "a", json!({"v": "a"}))),
             ("masterPassword", version(2 * DAY, "a", json!({"v": "a"}))),
         ]);
         let newer = versions(vec![
             ("cipher:1", deletion(3 * DAY, "b")),
+            ("cipher:2", deletion(5 * DAY, "b")),
             ("masterPassword", version(3 * DAY, "b", json!({"v": "b"}))),
         ]);
-        let older = versions(vec![
-            ("cipher:1", version(DAY, "c", json!({"v": "c"}))),
-            ("masterPassword", version(DAY, "c", json!({"v": "c"}))),
-        ]);
-        let with_older = [source("b", &newer, 0), source("c", &older, 0)];
-        let without_older = [source("b", &newer, 0)];
+        let newest = versions(vec![("cipher:1", deletion(4 * DAY, "c"))]);
+        let older = versions(vec![("cipher:1", version(DAY, "d", json!({"v": "d"})))]);
+        let others = [source("b", &newer, 0), source("c", &newest, 0)];
+        let with_older = [
+            source("b", &newer, 0),
+            source("c", &newest, 0),
+            source("d", &older, 0),
+        ];
         let due = 3 * DAY + GRACE_MILLIS;
+        let replaced = versions(vec![
+            ("cipher:1", deletion(4 * DAY, "c")),
+            ("cipher:2", version(6 * DAY, "a", json!({"v": "a"}))),
+        ]);
 
-        // A device that gets this file before the one with the deletion would take the older
-        // version for the item. An older master password is not kept longer for that.
-        assert_eq!(kept(&own, &with_older, 4 * DAY), ["cipher:1"]);
-        assert!(kept(&own, &without_older, 4 * DAY).is_empty());
-        // Once every device has had time to get the deletion, the item is left to it all the same.
-        assert!(kept(&own, &with_older, due).is_empty());
+        // The newest of the deletions takes the place of the item, whether or not a file has an
+        // older version of it: a device that gets this file before the one with the deletion can
+        // still have the file of the device that deleted the item from before, with an older
+        // version. A version that is newer than a deletion stays, and an older master password is
+        // left out right away.
+        assert_eq!(tidied(&own, &others, 4 * DAY), replaced);
+        assert_eq!(tidied(&own, &with_older, 4 * DAY), replaced);
+        // Once every device has had time to get a deletion, the item is left to it.
+        assert_eq!(keys(&tidied(&own, &others, due)), ["cipher:2"]);
+        let mut item = versions(vec![("cipher:1", version(2 * DAY, "a", json!({"v": "a"})))]);
+        assert!(tidy(&mut item, "a", &refs(&others), 4 * DAY));
+        assert!(!tidy(&mut item, "a", &refs(&others), 4 * DAY));
     }
 
     #[test]

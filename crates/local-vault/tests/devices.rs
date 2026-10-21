@@ -759,6 +759,48 @@ fn an_item_that_another_device_changed_stays_on_a_device_that_gets_the_files_out
 }
 
 #[test]
+fn a_deleted_item_stays_deleted_on_a_device_that_gets_the_files_out_of_order() {
+    let (devices, token, user_id) = Devices::registered();
+    // The other device creates the item, and the first one changes it. The other device keeps
+    // the version that it created, as the change has not been in the file of the first one for
+    // 90 days.
+    let cipher = create_cipher(&devices.b, &token, "2.first");
+    devices.sync_files();
+    devices.a.platform.set_now(NOON + MINUTE);
+    let changed = update_cipher(&devices.a, &token, &cipher, "2.changed");
+    assert_eq!(changed.code, 200);
+    devices.sync_files();
+    // A third device has the files of both as they are now.
+    let c_fs = MemoryFileSystem::new();
+    deliver(&devices.a_fs, DEVICE, &c_fs);
+    deliver(&devices.b_fs, OTHER_DEVICE, &c_fs);
+    let c_platform = TestPlatform::seeded(NOON + 4 * MINUTE, 1 << 50);
+    let c = Client::on_device(c_fs.clone(), c_platform, ClientKind::Android, "device-c");
+    assert_eq!(names(&sync(&c, &token)["ciphers"]), ["2.changed"]);
+
+    // The other device deletes the item, which puts the deletion in place of the version that it
+    // created. The first device puts the deletion in place of its change when it next writes.
+    devices.b.platform.set_now(NOON + 2 * MINUTE);
+    let path = format!("ciphers/{}", id(&cipher));
+    assert_eq!(devices.b.call("DELETE", &path, &token).code, 200);
+    deliver(&devices.b_fs, OTHER_DEVICE, &devices.a_fs);
+    devices.a.platform.set_now(NOON + 3 * MINUTE);
+    create_cipher(&devices.a, &token, "2.other");
+    let a_file = read_json(&devices.a_fs, &device_file(&user_id, DEVICE));
+    assert!(a_file["records"].get(cipher_key(&cipher)).is_none());
+    assert!(a_file["tombstones"].get(cipher_key(&cipher)).is_some());
+
+    // The third device gets the new file of the first device before the new one of the other
+    // device, and still has the file of the other device from before, with the version that it
+    // created. It does not take that version for the item, so a change of the item there, which
+    // would bring it back for every device, cannot be made.
+    deliver(&devices.a_fs, DEVICE, &c_fs);
+
+    assert_eq!(names(&sync(&c, &token)["ciphers"]), ["2.other"]);
+    assert_eq!(update_cipher(&c, &token, &cipher, "2.edited").code, 404);
+}
+
+#[test]
 fn a_deletion_is_kept_while_another_device_holds_the_item() {
     let (devices, token, user_id) = Devices::registered();
     let cipher = create_cipher(&devices.a, &token, "2.item");
@@ -786,20 +828,26 @@ fn a_deletion_is_forgotten_after_a_grace_period_once_no_device_holds_the_item() 
     let file = || read_json(&devices.b_fs, &device_file(&user_id, OTHER_DEVICE));
     let has_deletion = || file()["tombstones"].get(cipher_key(&cipher)).is_some();
 
-    // The first device leaves the item out of its file when it syncs.
+    // The first device puts the deletion in place of the item in its file when it syncs.
     devices.a.platform.set_now(NOON + DAY);
     sync(&devices.a, &token);
     devices.sync_files();
-    let a_file = read_json(&devices.a_fs, &device_file(&user_id, DEVICE));
-    assert!(a_file["records"].get(cipher_key(&cipher)).is_none());
+    let a_file = || read_json(&devices.a_fs, &device_file(&user_id, DEVICE));
+    let a_has_deletion = || a_file()["tombstones"].get(cipher_key(&cipher)).is_some();
+    assert!(a_file()["records"].get(cipher_key(&cipher)).is_none());
+    assert!(a_has_deletion());
 
     devices.b.platform.set_now(NOON + 2 * DAY);
     sync(&devices.b, &token);
     assert!(has_deletion());
 
+    // Both forget it once it is old enough.
     devices.b.platform.set_now(NOON + GRACE + DAY);
     sync(&devices.b, &token);
     assert!(!has_deletion());
+    devices.a.platform.set_now(NOON + GRACE + DAY);
+    sync(&devices.a, &token);
+    assert!(!a_has_deletion());
     devices.sync_files();
     for client in devices.clients() {
         assert_eq!(sync(client, &token)["ciphers"], json!([]));
