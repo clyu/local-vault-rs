@@ -19,6 +19,7 @@
 mod account;
 mod conformance;
 mod date;
+mod devices;
 mod exchange;
 mod fs;
 mod http;

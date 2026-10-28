@@ -133,17 +133,32 @@ impl WasmLocalServer {
     /// the client, such as a UUID that it keeps, which is the same every time. The client writes
     /// its changes to a directory of the vault folder named after it, which no other device
     /// writes. Throws if the ID cannot be the name of a directory.
+    ///
+    /// The name and the type of the device are what the client names it to a Bitwarden server as
+    /// it logs in (`deviceName` and `deviceType`), which the files of the device say, so that the
+    /// devices that share the vault folder can be told apart.
     #[wasm_bindgen(constructor)]
     pub fn new(
         file_system: JsFileSystem,
         platform: JsPlatform,
         #[wasm_bindgen(unchecked_param_type = "\"browser\" | \"android\"")] client: &str,
         device_id: &str,
+        device_name: &str,
+        device_type: i32,
     ) -> Result<WasmLocalServer, JsError> {
         let client = client_kind(client)?;
         let file_system = HostFileSystem(file_system);
-        let server = LocalServer::new(file_system, HostPlatform(platform), client, device_id)
-            .map_err(|error| JsError::new(error.message()))?;
+        let platform = HostPlatform(platform);
+        let device_type = i64::from(device_type);
+        let server = LocalServer::new(
+            file_system,
+            platform,
+            client,
+            device_id,
+            device_name,
+            device_type,
+        )
+        .map_err(|error| JsError::new(error.message()))?;
         Ok(Self {
             server: Rc::new(server),
         })

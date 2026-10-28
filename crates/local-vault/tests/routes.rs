@@ -102,6 +102,8 @@ fn what_is_answered_is_known_without_making_the_request() {
         ("GET", item.as_str()),
         ("PUT", archive.as_str()),
         ("PUT", "devices/identifier/id/token"),
+        ("GET", "local-vault/devices"),
+        ("POST", "local-vault/devices/device-x/retire"),
         ("PUT", "attachments/a/b/c"),
         ("GET", "sends"),
         ("PUT", share.as_str()),

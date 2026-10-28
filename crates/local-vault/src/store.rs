@@ -1,20 +1,27 @@
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::ops::Deref;
 
 use serde_json::{Value, json};
 
-use crate::date::parse_date_millis;
+use crate::date::{format_date, parse_date_millis};
 use crate::fs::{FileSystem, IoError};
 use crate::json::{
     self, JsonObject, int, is_entry_name, is_safe_segment, normalize_email, obj, string,
 };
-use crate::merge::{self, Removal, Scope, Source, Versions};
+use crate::merge::{self, DeviceDescription, GRACE_MILLIS, Removal, Scope, Source, Versions};
 
 /// The value of the `format` field that identifies a local vault file.
 pub const LOCAL_VAULT_FORMAT: &str = "bitwarden-local-vault";
 
-/// The version of the local vault file layout that is written.
+/// The version of the local vault file layout that is written: that of the `vault.json` of an
+/// account, and that of the file of a device that did not retire another one.
 pub const LOCAL_VAULT_VERSION: i64 = 2;
+
+/// The version of the file of a device that says which devices it retired. A device writes it only
+/// then, so that a client that does not know of retired devices takes the vault for one of a
+/// layout that it does not know, which it neither uses nor writes, only once a device was retired.
+pub(crate) const RETIRED_DEVICES_VERSION: i64 = 3;
 
 /// The version of the layout before this one, in which the `vault.json` of an account held the
 /// whole vault. The devices took such vaults over into their files, and they are no longer read.
@@ -72,11 +79,17 @@ const EARLIER_LAYOUT_MESSAGE: &str =
 ///
 /// In the earlier layout, `vault.json` held the whole vault, which the devices took over into
 /// their files. Such a vault is no longer read: an account that still has one cannot be used.
+///
+/// A device that is gone for good can be retired by another one, which takes its file over. The
+/// vault is then put together without that file, and its directory is deleted 90 days later (see
+/// [`Self::retire_device`]).
 pub(crate) struct LocalVaultStore<F> {
     file_system: F,
     /// The ID of this device, which names the directory that it writes its files in. The local
     /// server is only made for one that can be the name of a directory.
     device_id: String,
+    /// What this device is, which its files say.
+    description: DeviceDescription,
 }
 
 /// The vault of an account as it was read, along with the versions that it was put together
@@ -150,29 +163,137 @@ impl From<IoError> for ReadError {
 struct AccountFiles {
     /// Whether `vault.json` says that the directory has this layout.
     has_marker: bool,
-    /// The files of the devices, sorted by the IDs of the devices.
-    devices: Vec<Source>,
+    /// The files of the devices, sorted by the IDs of the devices, those of the devices that were
+    /// retired included.
+    devices: Vec<DeviceFile>,
+}
+
+/// The file of a device in the vault of an account, as it was read.
+struct DeviceFile {
+    source: Source,
+    /// Whether it is the `vault.json` of the directory of the device, and not a file that stands
+    /// in for it while it is replaced, which can be older than a `vault.json` that has not fully
+    /// come yet.
+    is_in_place: bool,
+    /// When the device was retired, if it was and this is the file that was taken over, or an
+    /// earlier one (see [`merge::left_out`]). The vault is not put together from it.
+    retired_at: Option<i64>,
+    /// The latest revision date that a file of the device had when another device took it over,
+    /// if one did (see [`merge::taken_over_until`]). What the file holds since then is not part
+    /// of the vault.
+    taken_over_until: Option<i64>,
+}
+
+impl DeviceFile {
+    /// The versions of the file that the vault is put together from: all of them, but for those
+    /// that it holds since a file of its device that another device took over.
+    fn counted(&self) -> Cow<'_, Versions> {
+        self.source.not_taken_over(self.taken_over_until)
+    }
+
+    /// Returns `true` if the device was retired 90 days ago or longer, which every device has had
+    /// time to learn: its file no longer counts for anything, and its directory is deleted.
+    fn is_gone(&self, now_millis: i64) -> bool {
+        let retired_at = self.retired_at;
+        retired_at.is_some_and(|at| now_millis.saturating_sub(at) >= GRACE_MILLIS)
+    }
 }
 
 impl AccountFiles {
-    /// Takes the file of the device out of the files, if there is one.
-    fn take_device(&mut self, device_id: &str) -> Option<Source> {
-        let is_device = |source: &Source| source.device_id == device_id;
-        let index = self.devices.iter().position(is_device)?;
-        Some(self.devices.remove(index))
+    /// The files that the vault is put together from: those of the devices that were not retired.
+    fn current(&self) -> impl Iterator<Item = &DeviceFile> {
+        self.devices.iter().filter(|file| file.retired_at.is_none())
+    }
+
+    /// The latest revision date that a file of the device had when another device took it over, as
+    /// any of the files says (see [`merge::latest_taken_over`]).
+    fn latest_taken_over(&self, device_id: &str) -> Option<i64> {
+        let sources = self.devices.iter().map(|file| &file.source);
+        merge::latest_taken_over(sources, device_id)
+    }
+
+    /// Takes the file that the device writes its own from out of the files, if there is one: its
+    /// file, also once it was retired, until that was 90 days ago. A device that does not have the
+    /// note that it was retired yet still puts the vault together from that file, and does not have
+    /// what the device that retired it took over from it. From then on, the device starts a file of
+    /// its own again.
+    fn take_own(&mut self, device_id: &str, now_millis: i64) -> Option<Source> {
+        let is_own =
+            |file: &DeviceFile| file.source.device_id == device_id && !file.is_gone(now_millis);
+        let index = self.devices.iter().position(is_own)?;
+        Some(self.devices.remove(index).source)
+    }
+
+    /// Returns `true` if the device was retired and its file is the one that was taken over, or an
+    /// earlier one.
+    fn is_retired(&self, device_id: &str) -> bool {
+        let file = self
+            .devices
+            .iter()
+            .find(|file| file.source.device_id == device_id);
+        file.is_some_and(|file| file.retired_at.is_some())
+    }
+
+    /// The files that a device weighs its own against when it leaves out what it no longer has to
+    /// hold: those of the other devices, those of the devices that were retired less than 90 days
+    /// ago included. A device that does not have the note that one was retired yet still puts the
+    /// vault together from its file, and a deletion that the file holds an older version for has to
+    /// be kept as long as it does.
+    fn others(&self, now_millis: i64) -> Vec<&Source> {
+        let counted = self.devices.iter().filter(|file| !file.is_gone(now_millis));
+        counted.map(|file| &file.source).collect()
+    }
+
+    /// The devices whose directories are deleted, as they were retired 90 days ago or longer: those
+    /// whose `vault.json` is the file that was taken over. A file that stands in for it can be older
+    /// than a `vault.json` that has not fully come yet, which would be deleted with it.
+    fn gone(&self, now_millis: i64) -> Vec<&str> {
+        let gone = self.devices.iter();
+        let gone = gone.filter(|file| file.is_in_place && file.is_gone(now_millis));
+        gone.map(|file| file.source.device_id.as_str()).collect()
     }
 
     /// The versions that the vault is made of (see [`merge::merge`]).
     fn merged(&self) -> Versions {
-        merge::merge(self.devices.iter().map(|source| &source.versions))
+        let counted: Vec<Cow<'_, Versions>> = self.current().map(DeviceFile::counted).collect();
+        merge::merge(counted.iter().map(Cow::as_ref))
     }
 
     /// The latest date that one of the files was written at.
     fn revision_date(&self) -> Value {
-        let dates = self.devices.iter().map(|source| &source.revision_date);
+        let dates = self.current().map(|file| &file.source.revision_date);
         let latest = dates.max_by_key(|date| date.as_str().and_then(parse_date_millis));
         latest.cloned().unwrap_or(Value::Null)
     }
+}
+
+/// A device that has a file in the vault of an account.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Device {
+    pub(crate) id: String,
+    /// Whether it is this device.
+    pub(crate) is_this_device: bool,
+    /// When the device last changed the vault, as its file says, if it says so.
+    pub(crate) revision_date: Option<i64>,
+    /// When the device was retired, if it was and its file is the one that was taken over.
+    pub(crate) retired_at: Option<i64>,
+    /// What the device is, as its file says, if it says so, or as this device is now.
+    pub(crate) description: Option<DeviceDescription>,
+}
+
+/// What came of retiring a device.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Retiring {
+    /// The device is retired: this device took its file over, now or before, or another one did.
+    Retired(Device),
+    /// The device is this one.
+    ThisDevice,
+    /// The device has no file in the vault of the account.
+    NoFile,
+    /// The `vault.json` of the device has not fully come, or does not say when the device last
+    /// changed the vault. A file that stands in for it can be older than one that is on its way,
+    /// and the note that the device was retired could not tell the two apart.
+    NotComplete,
 }
 
 /// What a directory of the vault folder has in its `vault.json`, or in the files that stand in
@@ -180,9 +301,15 @@ impl AccountFiles {
 enum Content {
     /// No file that is complete.
     Nothing,
-    /// A file of a local vault, with the version of its layout, or `None` if its version is not
-    /// an integer, as that of no layout is.
-    Vault(Option<i64>, JsonObject),
+    /// A file of a local vault.
+    Vault {
+        /// The version of its layout, or `None` if its version is not an integer, as that of no
+        /// layout is.
+        version: Option<i64>,
+        content: JsonObject,
+        /// Whether it is the `vault.json` of the directory, and not a file that stands in for it.
+        is_in_place: bool,
+    },
     /// The `vault.json` of an account that was deleted.
     Deleted,
     /// A file that is not a local vault.
@@ -190,11 +317,12 @@ enum Content {
 }
 
 impl<F: FileSystem> LocalVaultStore<F> {
-    /// A store on the file system, for the device with the ID.
-    pub(crate) fn new(file_system: F, device_id: &str) -> Self {
+    /// A store on the file system, for the device with the ID, which is what the description says.
+    pub(crate) fn new(file_system: F, device_id: &str, description: DeviceDescription) -> Self {
         Self {
             file_system,
             device_id: device_id.to_owned(),
+            description,
         }
     }
 
@@ -319,7 +447,8 @@ impl<F: FileSystem> LocalVaultStore<F> {
     /// The file that is replaced is kept as the backup, and an interrupted write never leaves
     /// the device without a complete file. The change stands once that file is written: a
     /// `vault.json` of the account that cannot be written after it is written with the next one,
-    /// unless another device has a file of the account by then.
+    /// unless another device has a file of the account by then. The file gets a later revision
+    /// date than the one that it replaces (see [`next_revision_date`]).
     pub(crate) async fn write_vault(
         &self,
         account_id: &str,
@@ -338,17 +467,21 @@ impl<F: FileSystem> LocalVaultStore<F> {
             Err(ReadError::Io(error)) => return Err(error),
         };
         let changes = merge::changes(&read.base, vault, now_millis, &self.device_id);
-        let mut own = files.take_device(&self.device_id).unwrap_or_default();
+        let mut own = files
+            .take_own(&self.device_id, now_millis)
+            .unwrap_or_default();
         // The content of an attachment that the change removes is deleted once nothing can bring
         // the attachment back (see `Self::tidy`).
         for ids in merge::removed_attachments(&read.base, &changes) {
             own.removed_attachments.insert(ids, now_millis);
         }
         own.versions.extend(changes);
-        let others: Vec<&Source> = files.devices.iter().collect();
-        merge::tidy(&mut own.versions, &others, now_millis);
-        own.revision_date = vault.get(KEY_REVISION_DATE).cloned().unwrap_or(Value::Null);
-        self.write_own_file(account_id, &own).await?;
+        merge::tidy(&mut own.versions, &files.others(now_millis), now_millis);
+        let changed_at = string(vault, KEY_REVISION_DATE).and_then(parse_date_millis);
+        let changed_at = changed_at.unwrap_or(now_millis);
+        let taken_over = files.latest_taken_over(&self.device_id);
+        own.revision_date = next_revision_date(&own.revision_date, taken_over, changed_at);
+        self.write_own_file(account_id, &mut own).await?;
         // Only the device that the account first has a file of writes it: the only one that has
         // a file, as the device that registers the account does. Another device that does not have
         // it yet gets it from that device. If it wrote it, it could do so as a device that deletes
@@ -377,6 +510,15 @@ impl<F: FileSystem> LocalVaultStore<F> {
     /// deleted as [`merge::removal`] says. Content that cannot be deleted is deleted the next
     /// time.
     ///
+    /// The directories of the devices that were retired 90 days ago or longer are deleted, by
+    /// whichever device tidies first (see [`Self::retire_device`]). A device that was retired
+    /// itself, but still uses the vault, writes its file again with a later revision date, which
+    /// makes the note one about the file before: it is not retired anymore.
+    ///
+    /// A file that does not say what this device is now is written again as well, with the same
+    /// revision date, so that a device that only reads the vault says so too (see
+    /// [`DeviceDescription`]).
+    ///
     /// Fails if the file of this device could not be written.
     pub(crate) async fn tidy(&self, account_id: &str, now_millis: i64) -> Result<(), IoError> {
         let mut files = match self.read_files(account_id, Scope::Vault).await {
@@ -384,11 +526,17 @@ impl<F: FileSystem> LocalVaultStore<F> {
             Ok(None) | Err(ReadError::Unusable(..)) => return Ok(()),
             Err(ReadError::Io(error)) => return Err(error),
         };
+        // Their files no longer count either way, so a directory that cannot be deleted is
+        // deleted the next time.
+        for device_id in files.gone(now_millis) {
+            self.delete_device_directory(account_id, device_id).await;
+        }
         let merged = files.merged();
-        let Some(mut own) = files.take_device(&self.device_id) else {
+        let is_retired = files.is_retired(&self.device_id);
+        let Some(mut own) = files.take_own(&self.device_id, now_millis) else {
             return Ok(());
         };
-        let others: Vec<&Source> = files.devices.iter().collect();
+        let others = files.others(now_millis);
         let mut is_changed = merge::tidy(&mut own.versions, &others, now_millis);
         // The items that the vault no longer has, whose content is gone now.
         let mut gone = BTreeSet::new();
@@ -415,14 +563,149 @@ impl<F: FileSystem> LocalVaultStore<F> {
         for cipher_id in &gone {
             self.delete_item_directory(account_id, cipher_id).await;
         }
+        if is_retired {
+            let taken_over = files.latest_taken_over(&self.device_id);
+            own.revision_date = next_revision_date(&own.revision_date, taken_over, now_millis);
+            is_changed = true;
+        }
+        // Such as one that an earlier client wrote: a device that only reads the vault would
+        // otherwise never say what it is.
+        is_changed |= own.description.as_ref() != Some(&self.description);
         if is_changed {
-            self.write_own_file(account_id, &own).await?;
+            self.write_own_file(account_id, &mut own).await?;
         }
         Ok(())
     }
 
-    /// Replaces the file of this device in the directory of the account.
-    async fn write_own_file(&self, account_id: &str, own: &Source) -> Result<(), IoError> {
+    /// Retires the device with the ID, which is gone for good, so that what it would have left out
+    /// of its file is left out: this device takes its file over into its own (see
+    /// [`merge::take_over`]), and notes that it did, along with the revision date of that file.
+    /// The vault stays the same, and is put together without that file on every device that has
+    /// the note (see [`merge::left_out`]). Every device keeps the file as one that it weighs its
+    /// own against for 90 days, the time that the note can take to come to every device, and then
+    /// deletes the directory of the device.
+    ///
+    /// A device that is still in use is not retired for long: changing the vault, and tidying its
+    /// file, give its file a later revision date, and the note is then one about the file before.
+    /// Only a device that writes its file from the one that was taken over shortly before the 90
+    /// days are up, and whose file comes to the other devices after they deleted its directory,
+    /// can lose that change, or bring back items whose deletions were forgotten in the meantime.
+    ///
+    /// Nothing is written for a device that is retired already, or that cannot be: this device,
+    /// one without a file, and one whose `vault.json` has not fully come or does not say when the
+    /// device last changed the vault. Fails if the file of this device could not be written.
+    pub(crate) async fn retire_device(
+        &self,
+        account_id: &str,
+        device_id: &str,
+        now_millis: i64,
+    ) -> Result<Retiring, IoError> {
+        if device_id == self.device_id {
+            return Ok(Retiring::ThisDevice);
+        }
+        let mut files = match self.read_files(account_id, Scope::Vault).await {
+            Ok(Some(files)) => files,
+            Ok(None) | Err(ReadError::Unusable(..)) => {
+                return Err(IoError::new(NOT_WRITABLE_MESSAGE));
+            }
+            Err(ReadError::Io(error)) => return Err(error),
+        };
+        let is_device = |file: &&DeviceFile| file.source.device_id == device_id;
+        let Some(retired) = files.devices.iter().find(is_device) else {
+            return Ok(Retiring::NoFile);
+        };
+        if retired.retired_at.is_some() {
+            return Ok(Retiring::Retired(self.device_of(retired)));
+        }
+        let revision_date = retired.source.revision_date.as_str();
+        let revision_date = revision_date.and_then(parse_date_millis);
+        let Some(revision_date) = revision_date.filter(|_| retired.is_in_place) else {
+            return Ok(Retiring::NotComplete);
+        };
+        let description = retired.source.description.clone();
+        // Not earlier than any file that this device read, so that a clock that is behind does
+        // not make the note older than it is.
+        let dates = files.devices.iter().map(|file| &file.source.revision_date);
+        let latest = dates
+            .filter_map(|date| date.as_str().and_then(parse_date_millis))
+            .max();
+        let at = latest.map_or(now_millis, |latest| latest.max(now_millis));
+        let merged = files.merged();
+        let mut own = files
+            .take_own(&self.device_id, now_millis)
+            .unwrap_or_default();
+        if let Some(retired) = files.devices.iter().find(is_device) {
+            let own_device_id = self.device_id.as_str();
+            merge::take_over(
+                &mut own,
+                own_device_id,
+                &retired.source,
+                retired.taken_over_until,
+                &merged,
+                at,
+                now_millis,
+            );
+        }
+        merge::tidy(&mut own.versions, &files.others(now_millis), now_millis);
+        let taken_over = files.latest_taken_over(&self.device_id);
+        own.revision_date = next_revision_date(&own.revision_date, taken_over, now_millis);
+        self.write_own_file(account_id, &mut own).await?;
+        Ok(Retiring::Retired(Device {
+            id: device_id.to_owned(),
+            is_this_device: false,
+            revision_date: Some(revision_date),
+            retired_at: Some(at),
+            description,
+        }))
+    }
+
+    /// Returns the devices that have a file in the vault of the account, sorted by their IDs, those
+    /// that were retired and whose directories are not deleted yet included, and this device
+    /// whether or not it has one. Returns `None` if the account is not there.
+    pub(crate) async fn devices(&self, account_id: &str) -> Result<Option<Vec<Device>>, ReadError> {
+        let Some(files) = self.read_files(account_id, Scope::Account).await? else {
+            return Ok(None);
+        };
+        let devices = files.devices.iter().map(|file| self.device_of(file));
+        let mut devices: Vec<Device> = devices.collect();
+        if !devices.iter().any(|device| device.is_this_device) {
+            devices.push(Device {
+                id: self.device_id.clone(),
+                is_this_device: true,
+                revision_date: None,
+                retired_at: None,
+                description: Some(self.description.clone()),
+            });
+            devices.sort_by(|a, b| a.id.cmp(&b.id));
+        }
+        Ok(Some(devices))
+    }
+
+    /// The device of the file, as the list of the devices of the account has it. This device is
+    /// what it is now, which its file may not say yet.
+    fn device_of(&self, file: &DeviceFile) -> Device {
+        let revision_date = file.source.revision_date.as_str();
+        let is_this_device = file.source.device_id == self.device_id;
+        let description = if is_this_device {
+            Some(self.description.clone())
+        } else {
+            file.source.description.clone()
+        };
+        Device {
+            id: file.source.device_id.clone(),
+            is_this_device,
+            revision_date: revision_date.and_then(parse_date_millis),
+            retired_at: file.retired_at,
+            description,
+        }
+    }
+
+    /// Replaces the file of this device in the directory of the account, which then says what this
+    /// device is now.
+    async fn write_own_file(&self, account_id: &str, own: &mut Source) -> Result<(), IoError> {
+        // A file that this device starts has no ID yet.
+        own.device_id.clone_from(&self.device_id);
+        own.description = Some(self.description.clone());
         let file = own.to_file();
         let directory = [account_id, DEVICES_DIRECTORY, self.device_id.as_str()];
         self.write_file(&directory, &Value::Object(file)).await
@@ -522,9 +805,42 @@ impl<F: FileSystem> LocalVaultStore<F> {
         }
     }
 
+    /// Deletes the directory of a device that was retired, with everything in it. One that cannot
+    /// be deleted is left behind, as its files no longer count, and deleted the next time.
+    ///
+    /// Its `vault.json` goes last, after everything else in it: the directory is only deleted
+    /// while that file is in its place (see `AccountFiles::gone`), so a deletion that stops before
+    /// it is done has to leave it. A file that stands in for it, left on its own, would keep the
+    /// directory for good. A tool that syncs the folder brings the deletions to the other devices
+    /// in the same order, if it keeps to it.
+    async fn delete_device_directory(&self, account_id: &str, device_id: &str) {
+        if !is_safe_segment(account_id) || !is_safe_segment(device_id) {
+            return;
+        }
+        let directory = [account_id, DEVICES_DIRECTORY, device_id];
+        let Ok(names) = self.file_system.list(&directory).await else {
+            return;
+        };
+        let mut is_emptied = true;
+        // An entry whose name the file system is not handed goes with the directory.
+        let is_other_entry = |name: &&String| *name != VAULT_FILE && is_entry_name(name);
+        for name in names.iter().filter(is_other_entry) {
+            let deletion = self.file_system.delete(&file_path(&directory, name)).await;
+            is_emptied &= matches!(deletion, Ok(true));
+        }
+        let vault_file = file_path(&directory, VAULT_FILE);
+        if is_emptied && matches!(self.file_system.delete(&vault_file).await, Ok(true)) {
+            let _ = self.file_system.delete(&directory).await;
+        }
+    }
+
     /// Reads the records in the scope of the files of the vault of the account, or returns `None`
     /// if the account is not there: it was deleted, or the directory is not that of an account.
     /// Fails with [`Unusable::UnknownLayout`] if a file has a layout that is not known.
+    ///
+    /// The files of the devices that were retired are among them, as such (see
+    /// [`merge::left_out`]), and each file says until when a file of its device was taken over
+    /// (see [`merge::taken_over_until`]).
     async fn read_files(
         &self,
         account_id: &str,
@@ -534,36 +850,65 @@ impl<F: FileSystem> LocalVaultStore<F> {
             return Ok(None);
         }
         let unusable = |why| ReadError::Unusable(account_id.to_owned(), why);
-        let mut files = AccountFiles::default();
+        let mut has_marker = false;
         let directory = [account_id];
         match self.read_content(&directory, &ACCOUNT_READ_ORDER).await? {
             Content::Nothing => {}
-            Content::Vault(Some(LOCAL_VAULT_VERSION), _) => files.has_marker = true,
-            Content::Vault(Some(SINGLE_FILE_VERSION), _) => {
+            Content::Vault {
+                version: Some(LOCAL_VAULT_VERSION),
+                ..
+            } => has_marker = true,
+            Content::Vault {
+                version: Some(SINGLE_FILE_VERSION),
+                ..
+            } => {
                 return Err(unusable(Unusable::EarlierLayout));
             }
             // A newer client wrote it, so the account may well be there.
-            Content::Vault(..) => return Err(unusable(Unusable::UnknownLayout)),
+            Content::Vault { .. } => return Err(unusable(Unusable::UnknownLayout)),
             // The files of the devices are what is left of the account, if anything, or the
             // directory is not that of an account at all.
             Content::Deleted | Content::Unknown => return Ok(None),
         }
+        let mut sources = Vec::new();
+        let mut in_place = Vec::new();
         let devices_directory = [account_id, DEVICES_DIRECTORY];
         for device_id in safe_names(&self.file_system, &devices_directory).await? {
             let directory = [account_id, DEVICES_DIRECTORY, device_id.as_str()];
             match self.read_content(&directory, &DEVICE_READ_ORDER).await? {
                 Content::Nothing => {}
-                Content::Vault(Some(LOCAL_VAULT_VERSION), file) => {
-                    let source = Source::device(device_id.clone(), &file, scope);
-                    files.devices.push(source);
+                Content::Vault {
+                    version: Some(LOCAL_VAULT_VERSION | RETIRED_DEVICES_VERSION),
+                    content,
+                    is_in_place,
+                } => {
+                    sources.push(Source::device(device_id.clone(), &content, scope));
+                    in_place.push(is_in_place);
                 }
                 // Only a client that knows another layout writes anything else there.
-                Content::Vault(..) | Content::Deleted | Content::Unknown => {
+                Content::Vault { .. } | Content::Deleted | Content::Unknown => {
                     return Err(unusable(Unusable::UnknownLayout));
                 }
             }
         }
-        Ok(Some(files))
+        let left_out = merge::left_out(&sources);
+        let taken_over_until = merge::taken_over_until(&sources, &left_out);
+        let devices = sources.into_iter().zip(in_place);
+        let devices = devices.map(|(source, is_in_place)| {
+            let retired_at = left_out.get(&source.device_id).copied();
+            let taken_over_until = taken_over_until.get(&source.device_id).copied();
+            DeviceFile {
+                source,
+                is_in_place,
+                retired_at,
+                taken_over_until,
+            }
+        });
+        let devices = devices.collect();
+        Ok(Some(AccountFiles {
+            has_marker,
+            devices,
+        }))
     }
 
     /// Reads the first file of the directory that is complete, of those in the order. The files
@@ -571,7 +916,7 @@ impl<F: FileSystem> LocalVaultStore<F> {
     /// when it is not a vault that can be used: they hold an older one, and writing that one back
     /// would replace the one that is there.
     async fn read_content(&self, directory: &[&str], order: &[&str]) -> Result<Content, IoError> {
-        for file in order {
+        for &file in order {
             let bytes = self.file_system.read(&file_path(directory, file)).await?;
             // An interrupted write leaves a file that is not complete.
             let Some(value) = bytes.as_deref().and_then(json::parse) else {
@@ -588,7 +933,12 @@ impl<F: FileSystem> LocalVaultStore<F> {
                 return Ok(Content::Unknown);
             }
             let version = int(&content, KEY_VERSION);
-            return Ok(Content::Vault(version, content));
+            let is_in_place = file == VAULT_FILE;
+            return Ok(Content::Vault {
+                version,
+                content,
+                is_in_place,
+            });
         }
         Ok(Content::Nothing)
     }
@@ -634,6 +984,23 @@ fn file_path<'a>(directory: &[&'a str], file: &'a str) -> Vec<&'a str> {
     let mut path = directory.to_vec();
     path.push(file);
     path
+}
+
+/// The revision date of the file of a device that is written with a change made at `changed_at`:
+/// that time, or one millisecond after the revision date of the file that it replaces, or after
+/// `taken_over`, the latest one that a note says that a file of the device had when another device
+/// took it over (see [`merge::latest_taken_over`]), whichever is latest. Each file that a device
+/// writes with a change is thus later than every one before it, so a note that a file was taken
+/// over never counts for one that the device wrote after it (see [`merge::left_out`]), and what
+/// came into it then is not taken for what it holds since that one (see
+/// [`merge::Source::not_taken_over`]). That is also so for a file that the device starts once its
+/// directory was deleted, or whose file stands in for an older one, with a clock that is behind.
+fn next_revision_date(previous: &Value, taken_over: Option<i64>, changed_at: i64) -> Value {
+    let previous = previous.as_str().and_then(parse_date_millis);
+    let latest = previous.max(taken_over);
+    let after_latest = latest.map(|millis| millis.saturating_add(1));
+    let millis = after_latest.map_or(changed_at, |after| after.max(changed_at));
+    Value::String(format_date(millis))
 }
 
 /// Returns the accounts that the vault folder of the source has and that of the target does
@@ -782,7 +1149,17 @@ mod tests {
     }
 
     fn store_on<F: FileSystem>(fs: F) -> LocalVaultStore<F> {
-        LocalVaultStore::new(fs, DEVICE)
+        LocalVaultStore::new(fs, DEVICE, description("Pixel 8", 0))
+    }
+
+    /// A store of the other device, which is the extension in Chrome.
+    fn other_on<F: FileSystem>(fs: F) -> LocalVaultStore<F> {
+        LocalVaultStore::new(fs, OTHER_DEVICE, description("chrome", 2))
+    }
+
+    fn description(name: &str, device_type: i64) -> DeviceDescription {
+        let name = name.to_owned();
+        DeviceDescription { name, device_type }
     }
 
     /// Writes the vault of the account as a change of the vault that the store reads now, or as
@@ -857,7 +1234,8 @@ mod tests {
     }
 
     /// A file system that fails the writes and the deletions of the paths that it is given, as
-    /// a file that another program holds open, and does the rest.
+    /// a file that another program holds open, and does the rest. It deletes a directory one
+    /// entry at a time, in the order of their names, as a disk does, until one cannot be deleted.
     struct Failing {
         fs: MemoryFileSystem,
         writes: Vec<Vec<&'static str>>,
@@ -898,6 +1276,12 @@ mod tests {
 
         async fn delete(&self, path: &[&str]) -> Result<bool, IoError> {
             Self::check(&self.deletions, path)?;
+            for name in self.fs.list(path).await? {
+                let mut entry = path.to_vec();
+                entry.push(name.as_str());
+                Self::check(&self.deletions, &entry)?;
+                self.fs.delete(&entry).await?;
+            }
             self.fs.delete(path).await
         }
     }
@@ -935,6 +1319,64 @@ mod tests {
         assert_eq!(current.as_deref(), Some("third"));
         assert_eq!(backup.as_deref(), Some("second"));
         assert_eq!(fs.get(&device_file(DEVICE, VAULT_TEMP_FILE)), None);
+    }
+
+    #[test]
+    fn every_change_gives_the_file_of_the_device_a_later_revision_date() {
+        let fs = MemoryFileSystem::new();
+        let store = store_on(fs.clone());
+        let path = device_file(DEVICE, VAULT_FILE);
+        let revision_date =
+            || json::parse(&fs.get(&path).unwrap()).unwrap()[KEY_REVISION_DATE].clone();
+
+        write(&store, ID, "first");
+        assert_eq!(revision_date(), "2026-10-11T12:00:00.000Z");
+        // A change in the same millisecond, and one that a clock that was set back makes.
+        write(&store, ID, "second");
+        assert_eq!(revision_date(), "2026-10-11T12:00:00.001Z");
+        let mut earlier = vault("a@example.com", "third");
+        earlier[KEY_REVISION_DATE] = json!("2026-10-11T11:00:00.000Z");
+        save(&store, ID, &earlier, NOW - 3_600_000);
+
+        assert_eq!(revision_date(), "2026-10-11T12:00:00.002Z");
+        assert_eq!(marker_of(read(&store, ID)).as_deref(), Some("third"));
+    }
+
+    #[test]
+    fn the_vault_json_of_a_retired_device_is_deleted_last_so_that_its_directory_goes_in_the_end() {
+        let fs = MemoryFileSystem::new();
+        let other = other_on(fs.clone());
+        for marker in ["first", "second"] {
+            save(&other, ID, &vault("a@example.com", marker), NOW);
+        }
+        // A copy that a tool that syncs the folder kept of a file that it had two versions of.
+        let copy = device_file(OTHER_DEVICE, "vault.sync-conflict-20261011-120000.json");
+        let content = fs.get(&device_file(OTHER_DEVICE, VAULT_FILE)).unwrap();
+        fs.put(&copy, content);
+        let store = store_on(fs.clone());
+        let retiring = block_on(store.retire_device(ID, OTHER_DEVICE, NOW + 1)).unwrap();
+        assert!(matches!(retiring, Retiring::Retired(_)));
+        let later = NOW + 1 + GRACE_MILLIS;
+        let backup = device_file(OTHER_DEVICE, VAULT_BACKUP_FILE);
+        let failing = Failing {
+            fs: fs.clone(),
+            writes: Vec::new(),
+            deletions: vec![backup.to_vec()],
+        };
+
+        // The backup cannot be deleted for now, which stops the deletion before `vault.json`.
+        block_on(store_on(failing).tidy(ID, later)).unwrap();
+
+        assert!(fs.get(&copy).is_none());
+        assert!(fs.get(&backup).is_some());
+        assert!(fs.get(&device_file(OTHER_DEVICE, VAULT_FILE)).is_some());
+        let devices = block_on(store.devices(ID)).unwrap().unwrap();
+        let listed = devices.iter().find(|device| device.id == OTHER_DEVICE);
+        assert_eq!(listed.unwrap().retired_at, Some(NOW + 1));
+        // So the directory is deleted the next time.
+        block_on(store.tidy(ID, later)).unwrap();
+        let directory = [ID, DEVICES_DIRECTORY, OTHER_DEVICE];
+        assert!(!block_on(fs.exists(&directory)).unwrap());
     }
 
     #[test]
@@ -1032,7 +1474,7 @@ mod tests {
     fn the_vault_is_put_together_from_the_files_of_every_device() {
         let fs = MemoryFileSystem::new();
         let store = store_on(fs.clone());
-        let other = LocalVaultStore::new(fs.clone(), OTHER_DEVICE);
+        let other = other_on(fs.clone());
         write(&store, ID, "first");
         let mut changed = vault("a@example.com", "first");
         let folder = json!([{"id": "folder", "name": "2.folder"}]);
@@ -1042,10 +1484,13 @@ mod tests {
 
         let vault = read(&store, ID).unwrap();
         assert_eq!(vault[KEY_SYNC]["folders"], folder);
-        // The other device only wrote the folder, which is all that it changed.
+        // The other device only wrote the folder, which is all that it changed, and which came into
+        // its file as it wrote it.
         let other_file = json::parse(&fs.get(&device_file(OTHER_DEVICE, VAULT_FILE)).unwrap());
         let other_file = other_file.unwrap();
-        let stamp = json!({"at": NOW + 1, "by": "device-b"});
+        let revision_date = other_file[KEY_REVISION_DATE].as_str();
+        let written_at = revision_date.and_then(parse_date_millis);
+        let stamp = json!({"at": NOW + 1, "by": "device-b", "in": written_at});
         assert_eq!(other_file["records"], json!({"folder:folder": stamp}));
         assert_eq!(other_file[KEY_SYNC].get("profile"), None);
     }
@@ -1054,7 +1499,7 @@ mod tests {
     fn an_account_whose_record_is_on_its_way_is_not_taken_to_be_gone() {
         let fs = MemoryFileSystem::new();
         let store = store_on(fs.clone());
-        let other = LocalVaultStore::new(fs.clone(), OTHER_DEVICE);
+        let other = other_on(fs.clone());
         write(&store, ID, "first");
         let mut changed = vault("a@example.com", "first");
         changed.get_mut(KEY_SYNC).unwrap()["folders"] = json!([{"id": "folder"}]);
@@ -1089,7 +1534,7 @@ mod tests {
     fn an_account_that_was_deleted_is_not_there_whatever_is_left_of_it() {
         let fs = MemoryFileSystem::new();
         let store = store_on(fs.clone());
-        let other = LocalVaultStore::new(fs.clone(), OTHER_DEVICE);
+        let other = other_on(fs.clone());
         write(&store, ID, "first");
         let mut changed = vault("a@example.com", "first");
         changed.get_mut(KEY_SYNC).unwrap()["folders"] = json!([{"id": "folder"}]);
@@ -1164,7 +1609,7 @@ mod tests {
         let other_email = vault("other@example.com", "other");
         save(&store, "account-b", &other_email, NOW);
         // A newer client wrote the file of another device.
-        let newer = json!({"format": "bitwarden-local-vault", "version": 3});
+        let newer = json!({"format": "bitwarden-local-vault", "version": 4});
         fs.put(&device_file(OTHER_DEVICE, VAULT_FILE), newer.to_string());
         let unknown_layout = ReadError::Unusable(ID.to_owned(), Unusable::UnknownLayout);
         let find = |email: &str| find_ids(&store, email);
@@ -1206,7 +1651,7 @@ mod tests {
     fn only_the_device_that_an_account_first_has_a_file_of_writes_its_vault_json() {
         let fs = MemoryFileSystem::new();
         let store = store_on(fs.clone());
-        let other = LocalVaultStore::new(fs.clone(), OTHER_DEVICE);
+        let other = other_on(fs.clone());
         write(&store, ID, "first");
         // The other device has the file of the first one, but not the `vault.json` of the account.
         block_on(fs.delete(&[ID, VAULT_FILE])).unwrap();
@@ -1232,7 +1677,7 @@ mod tests {
         let unknown_layout = Err(ReadError::Unusable(ID.to_owned(), Unusable::UnknownLayout));
         let cases = [
             json!({"format": "something-else", "version": 2}),
-            json!({"format": "bitwarden-local-vault", "version": 3}),
+            json!({"format": "bitwarden-local-vault", "version": 4}),
             json!({"format": "bitwarden-local-vault"}),
             json!({"format": "bitwarden-local-vault", "version": "2"}),
             json!({"format": "bitwarden-local-vault-deleted"}),

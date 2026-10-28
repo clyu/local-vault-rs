@@ -103,7 +103,8 @@ fn nothing_changes_but_what_a_request_is_about() {
     assert_eq!(updated.code, 200);
     // The file of the device has a new version of the item, and is otherwise as it was: what the
     // device took over keeps the stamps that it was taken over with. Only `since`, which earlier
-    // clients wrote, is left out.
+    // clients wrote, is left out, and the file says what the device is, and when the new version
+    // came into it, which they did not.
     let mut renamed = note.clone();
     renamed["name"] = json!("2.renamed");
     renamed["favorite"] = json!(true);
@@ -112,8 +113,9 @@ fn nothing_changes_but_what_a_request_is_about() {
     expected["revisionDate"] = json!("2026-10-11T12:00:00.000Z");
     expected["sync"]["ciphers"][1] = renamed;
     let key = format!("cipher:{}", note["id"].as_str().unwrap().to_lowercase());
-    expected["records"][&key] = json!({"at": NOON, "by": DEVICE});
+    expected["records"][&key] = json!({"at": NOON, "by": DEVICE, "in": NOON});
     expected.as_object_mut().unwrap().shift_remove("since");
+    expected["device"] = json!({"id": DEVICE, "name": "chrome", "type": 2});
     assert_eq!(read_json(&fs, &device_file(USER_ID, DEVICE)), expected);
 }
 

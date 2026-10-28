@@ -176,6 +176,10 @@ impl LocalVaultServer {
     /// which is the same every time. The app writes its changes to a directory of the vault
     /// folder named after it, which no other device writes.
     ///
+    /// The name and the type of the device are what the app names it to a Bitwarden server as it
+    /// logs in (`deviceName` and `deviceType`): the model of the phone, and `0`. The files of the
+    /// device say them, so that the devices that share the vault folder can be told apart.
+    ///
     /// Fails with [`LocalVaultError::Io`] if the ID cannot be the name of a directory, as the
     /// local server would write nothing with it: every request that changes the vault would fail.
     #[uniffi::constructor]
@@ -184,10 +188,20 @@ impl LocalVaultServer {
         platform: Box<dyn VaultPlatform>,
         client: VaultClientKind,
         device_id: String,
+        device_name: String,
+        device_type: i32,
     ) -> Result<Arc<Self>, LocalVaultError> {
         let file_system = AppFileSystem(file_system);
         let platform = AppPlatform(platform);
-        let server = LocalServer::new(file_system, platform, client.into(), &device_id)?;
+        let device_type = i64::from(device_type);
+        let server = LocalServer::new(
+            file_system,
+            platform,
+            client.into(),
+            &device_id,
+            &device_name,
+            device_type,
+        )?;
         Ok(Arc::new(Self { server }))
     }
 
@@ -457,6 +471,17 @@ mod tests {
         }
     }
 
+    /// A local server for the app on the device with the ID, which is a Pixel 8.
+    fn new_server(
+        file_system: Box<dyn VaultFileSystem>,
+        platform: Box<dyn VaultPlatform>,
+        client: VaultClientKind,
+        device_id: &str,
+    ) -> Result<Arc<LocalVaultServer>, LocalVaultError> {
+        let (device_id, name) = (device_id.to_owned(), "Pixel 8".to_owned());
+        LocalVaultServer::new(file_system, platform, client, device_id, name, 0)
+    }
+
     fn request(method: &str, path: &str, body: &str) -> VaultRequest {
         let mut headers = HashMap::new();
         headers.insert("Content-Type".to_owned(), "application/json".to_owned());
@@ -475,7 +500,7 @@ mod tests {
         let platform = Box::new(Clock(Mutex::new(Vec::new())));
         let device = "11111111-2222-4333-8444-555555555555";
         let android = VaultClientKind::Android;
-        let created = LocalVaultServer::new(file_system, platform, android, device.to_owned());
+        let created = new_server(file_system, platform, android, device);
         let Ok(server) = created else {
             panic!("The server is not created.");
         };
@@ -516,7 +541,7 @@ mod tests {
             let file_system = Box::new(MemoryCallback(MemoryFileSystem::new()));
             let platform = Box::new(Clock(Mutex::new(Vec::new())));
             let android = VaultClientKind::Android;
-            let created = LocalVaultServer::new(file_system, platform, android, device.to_owned());
+            let created = new_server(file_system, platform, android, device);
             assert!(created.is_err(), "{device}");
         }
     }

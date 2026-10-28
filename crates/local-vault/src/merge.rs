@@ -18,7 +18,14 @@
 //! The content of an attachment is not a version: it is a file of its own, which every device
 //! shares. A device that removes an attachment from the vault keeps a note of it in its file, and
 //! deletes the content once nothing can bring the attachment back (see [`removal`]).
+//!
+//! A device that is gone for good never leaves anything out of its file. Another device can retire
+//! it: it takes the file over into its own, and notes that it did (see [`take_over`]). The vault is
+//! then put together without that file (see [`left_out`]), and without what a later file of that
+//! device still holds from it (see [`Source::not_taken_over`]).
 
+use std::borrow::Cow;
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashSet};
 
 use indexmap::IndexMap;
@@ -26,10 +33,12 @@ use serde_json::{Value, json};
 
 use crate::account::KEY_PASSWORD_VERIFIER;
 use crate::date::parse_date_millis;
-use crate::json::{JsonObject, element, eq_ignore_case, int, obj, objects, string, with_fields};
+use crate::json::{
+    JsonObject, element, eq_ignore_case, int, is_safe_segment, obj, objects, string, with_fields,
+};
 use crate::store::{
     KEY_ACCOUNT, KEY_FORMAT, KEY_REVISION_DATE, KEY_SYNC, KEY_VERSION, LOCAL_VAULT_FORMAT,
-    LOCAL_VAULT_VERSION,
+    LOCAL_VAULT_VERSION, RETIRED_DEVICES_VERSION,
 };
 
 /// The field of the file of a device with the stamps of the records that it holds, by their keys.
@@ -38,6 +47,13 @@ const KEY_RECORDS: &str = "records";
 /// The field of the file of a device with the stamps of the deletions that it holds, by the keys
 /// of the records.
 const KEY_TOMBSTONES: &str = "tombstones";
+
+/// The field of a stamp in the file of a device with when the version came into the file: the
+/// revision date that the file has when the device first writes it with the version, in
+/// milliseconds since the epoch. It tells what a file holds since a file of its device that another
+/// device took over from what came into it later (see [`Source::not_taken_over`]). Earlier clients
+/// did not write it.
+const KEY_CAME_IN: &str = "in";
 
 /// The field of the file of a device in which earlier clients wrote when the device first wrote
 /// it. It is not part of the record of the account, and is left out when the file is written.
@@ -48,8 +64,17 @@ const KEY_SINCE: &str = "since";
 /// removed them, in milliseconds since the epoch.
 const KEY_REMOVED_ATTACHMENTS: &str = "removedAttachments";
 
+/// The field of the file of a device with the devices that the device retired, by their IDs: when
+/// it retired each of them, and the revision date of the file of that device that it took over.
+const KEY_RETIRED_DEVICES: &str = "retiredDevices";
+
+/// The field of the file of a device that says what the device is (see [`DeviceDescription`]),
+/// with the ID of the device, which tells it from one that a client that does not know the field
+/// took over from the file of another device.
+const KEY_DEVICE: &str = "device";
+
 /// The fields of a file that are about the file, and not part of the record of the account.
-const FILE_FIELDS: [&str; 7] = [
+const FILE_FIELDS: [&str; 9] = [
     KEY_FORMAT,
     KEY_VERSION,
     KEY_REVISION_DATE,
@@ -57,6 +82,8 @@ const FILE_FIELDS: [&str; 7] = [
     KEY_RECORDS,
     KEY_TOMBSTONES,
     KEY_REMOVED_ATTACHMENTS,
+    KEY_RETIRED_DEVICES,
+    KEY_DEVICE,
 ];
 
 const FOLDERS: &str = "folders";
@@ -93,8 +120,9 @@ const MASTER_PASSWORD_FIELDS: [&[&str]; 5] = [
 /// of until that one was written that long ago, as a device that gets the file without the version
 /// before the file with the newer one would be without the record in the meantime. The content
 /// of an attachment that a device removed is kept that long as well, as a version of the item
-/// that has the attachment again may still be on its way.
-const GRACE_MILLIS: i64 = 90 * 24 * 60 * 60 * 1000;
+/// that has the attachment again may still be on its way. And so is the file of a device that was
+/// retired, as the file that says so may still be on its way to another device.
+pub(crate) const GRACE_MILLIS: i64 = 90 * 24 * 60 * 60 * 1000;
 
 /// Which records of a file are read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,8 +172,16 @@ impl Stamp {
         Some(Self { at, by })
     }
 
-    fn to_json(&self) -> Value {
-        json!({"at": self.at, "by": self.by})
+    /// The stamp as the file of a device has it, with when the version came into the file, if
+    /// that is known (see [`KEY_CAME_IN`]).
+    fn to_json(&self, came_in: Option<i64>) -> Value {
+        let mut stamp = JsonObject::new();
+        stamp.insert("at".to_owned(), Value::from(self.at));
+        stamp.insert("by".to_owned(), Value::from(self.by.as_str()));
+        if let Some(came_in) = came_in {
+            stamp.insert(KEY_CAME_IN.to_owned(), Value::from(came_in));
+        }
+        Value::Object(stamp)
     }
 }
 
@@ -204,27 +240,104 @@ pub(crate) struct Source {
     pub(crate) revision_date: Value,
     /// The attachments that the device removed and has yet to delete the content of.
     pub(crate) removed_attachments: RemovedAttachments,
+    /// The devices that the device retired, whose files it took over.
+    pub(crate) retired_devices: RetiredDevices,
+    /// What the device is, if the file says so.
+    pub(crate) description: Option<DeviceDescription>,
+    /// When the versions came into the file, as it was read (see [`Arrivals`]).
+    pub(crate) arrivals: Arrivals,
 }
+
+/// When the versions that the file of a device was read with came into it, as the file says, if
+/// it does (see [`KEY_CAME_IN`]), by the keys of the records, with the stamps of the versions. A
+/// version with another stamp came into the file when it is written.
+pub(crate) type Arrivals = BTreeMap<String, (Stamp, Option<i64>)>;
 
 impl Source {
     /// The file of the device with the ID, with its versions in the scope (see
     /// [`device_versions`]).
     pub(crate) fn device(device_id: String, file: &JsonObject, scope: Scope) -> Self {
         let revision_date = file.get(KEY_REVISION_DATE).cloned();
+        let retired_devices = retired_devices_of(file, &device_id);
+        let description = description_of(file, &device_id);
+        let versions = device_versions(file, scope);
+        let arrivals = arrivals_of(file, &versions);
         Self {
             device_id,
-            versions: device_versions(file, scope),
+            versions,
             revision_date: revision_date.unwrap_or(Value::Null),
             removed_attachments: removed_attachments_of(file),
+            retired_devices,
+            description,
+            arrivals,
         }
     }
 
-    /// The file of the device that holds the versions, and the attachments that it removed and
-    /// has yet to delete the content of.
+    /// Returns `true` if the file is the one that the retirement says was taken over, or one of
+    /// its device from before it: its revision date is that of the file that was taken over, or
+    /// earlier. A device gives every file that it writes with a change a later one than the one
+    /// before, so a file that it wrote after the one that was taken over is never taken for it. One
+    /// from before that one, such as a copy of the directory of the device from a backup, or its
+    /// backup left on its own while the directory is deleted, holds nothing that the vault is not
+    /// the same without: what the device left out of its file since then was replaced, or deleted
+    /// and the deletion forgotten. A revision date that is not a date is only that of the same file.
+    pub(crate) fn is_taken_over(&self, retirement: &Retirement) -> bool {
+        let revision_date = self.revision_date.as_str();
+        let taken_over = parse_date_millis(&retirement.revision_date);
+        match (revision_date.and_then(parse_date_millis), taken_over) {
+            (Some(written_at), Some(taken_over)) => written_at <= taken_over,
+            _ => revision_date == Some(retirement.revision_date.as_str()),
+        }
+    }
+
+    /// The versions of the file without those that it holds since a file of its device that
+    /// another device took over, the latest of which had the revision date `taken_over`, if there
+    /// is one (see [`taken_over_until`]). The device that took that file over holds them, or what
+    /// replaced them, so the vault is the same without them. A device that is retired but still in
+    /// use writes its file from the one that was taken over, also before the note comes to it,
+    /// which can be after the deletions of the records that it holds older versions of were
+    /// forgotten: those records would be back otherwise.
+    ///
+    /// The file says when a version came into it (see [`KEY_CAME_IN`]). One that it does not say
+    /// that of came into it with an earlier client, and is taken to be held since a file that was
+    /// taken over if the device wrote it before that file was written: a device that took it over
+    /// from another one, or wrote it later with a clock that was behind, is not told apart.
+    pub(crate) fn not_taken_over(&self, taken_over: Option<i64>) -> Cow<'_, Versions> {
+        let Some(taken_over) = taken_over else {
+            return Cow::Borrowed(&self.versions);
+        };
+        let versions = self.versions.iter();
+        let kept = versions.filter(|(key, version)| !self.is_held_since(key, version, taken_over));
+        let kept = kept.map(|(key, version)| (key.clone(), version.clone()));
+        Cow::Owned(kept.collect())
+    }
+
+    /// Returns `true` if the file holds the version since a file of its device whose revision date
+    /// was `taken_over` or earlier (see [`Self::not_taken_over`]).
+    fn is_held_since(&self, key: &str, version: &Version, taken_over: i64) -> bool {
+        match self.came_in(key, version, None) {
+            Some(came_in) => came_in <= taken_over,
+            None => version.stamp.by == self.device_id && version.stamp.at <= taken_over,
+        }
+    }
+
+    /// When the version came into the file: when the file says, if it was read with that
+    /// version, or else `written_at`, the revision date of the file that is written with it.
+    fn came_in(&self, key: &str, version: &Version, written_at: Option<i64>) -> Option<i64> {
+        match self.arrivals.get(key) {
+            Some((stamp, came_in)) if *stamp == version.stamp => *came_in,
+            _ => written_at,
+        }
+    }
+
+    /// The file of the device that holds the versions, with when each came into it, the attachments
+    /// that it removed and has yet to delete the content of, the devices that it retired, and what
+    /// the device is.
     pub(crate) fn to_file(&self) -> JsonObject {
         let account = self.versions.get(ACCOUNT_KEY);
         let account = account.and_then(|version| version.record.clone());
         let revision_date = self.revision_date.clone();
+        let written_at = revision_date.as_str().and_then(parse_date_millis);
         let mut file = assemble(&account.unwrap_or_default(), &self.versions, revision_date);
         let mut records = JsonObject::new();
         let mut tombstones = JsonObject::new();
@@ -234,7 +347,8 @@ impl Source {
             } else {
                 &mut tombstones
             };
-            stamps.insert(key.clone(), version.stamp.to_json());
+            let came_in = self.came_in(key, version, written_at);
+            stamps.insert(key.clone(), version.stamp.to_json(came_in));
         }
         file.insert(KEY_RECORDS.to_owned(), Value::Object(records));
         file.insert(KEY_TOMBSTONES.to_owned(), Value::Object(tombstones));
@@ -246,7 +360,230 @@ impl Source {
             KEY_REMOVED_ATTACHMENTS.to_owned(),
             Value::Object(removed.collect()),
         );
+        if let Some(description) = &self.description {
+            let device = json!({
+                "id": self.device_id,
+                "name": description.name,
+                "type": description.device_type,
+            });
+            file.insert(KEY_DEVICE.to_owned(), device);
+        }
+        if !self.retired_devices.is_empty() {
+            let retired = self.retired_devices.iter();
+            let retired = retired.map(|(device_id, retirement)| {
+                let note = json!({"at": retirement.at, "revisionDate": retirement.revision_date});
+                (device_id.clone(), note)
+            });
+            file.insert(
+                KEY_RETIRED_DEVICES.to_owned(),
+                Value::Object(retired.collect()),
+            );
+            // A client that does not know of retired devices takes the vault for one of a layout
+            // that it does not know, which it neither uses nor writes. It would take the field for
+            // part of the record of the account, and go on reading the files of the devices.
+            file.insert(KEY_VERSION.to_owned(), Value::from(RETIRED_DEVICES_VERSION));
+        }
         file
+    }
+}
+
+/// That a device retired another one, as the file of the device says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Retirement {
+    /// When the device was retired, in milliseconds since the epoch.
+    pub(crate) at: i64,
+    /// The revision date of the file of the device that was retired, as it was when it was taken
+    /// over.
+    pub(crate) revision_date: String,
+}
+
+impl Retirement {
+    /// Returns `true` if the note says more than another one about the same device: that a later
+    /// file of it was taken over, which leaves out every file that the other one does (see
+    /// [`Source::is_taken_over`]) and what a later file holds since then (see [`taken_over_until`]),
+    /// or that the same file was taken over earlier, which deletes its directory sooner.
+    fn supersedes(&self, other: &Self) -> bool {
+        let revision_date = |note: &Self| parse_date_millis(&note.revision_date);
+        match revision_date(self).cmp(&revision_date(other)) {
+            Ordering::Greater => true,
+            Ordering::Less => false,
+            Ordering::Equal => self.at < other.at,
+        }
+    }
+}
+
+/// The devices that a device retired, by their IDs.
+pub(crate) type RetiredDevices = BTreeMap<String, Retirement>;
+
+/// What a device is, as its client names it to a Bitwarden server when it logs in (`deviceName`
+/// and `deviceType`), so that the devices that share the vault folder can be told apart, and one
+/// that is still used, but only reads the vault, from one that is gone for good.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeviceDescription {
+    /// The name of the device: the model of a phone, or the browser that an extension is in.
+    pub(crate) name: String,
+    /// The kind of the device, as the Bitwarden API numbers them (`DeviceType`): `0` for Android,
+    /// `2` for an extension in Chrome, and so on.
+    pub(crate) device_type: i64,
+}
+
+/// The devices that the file of a device says that the device retired. A note that is not
+/// complete is left out, and so is one about the device itself, which no device writes. An ID is
+/// that of the directory of a device as it is named, so IDs are told apart as they are, case
+/// included, here and wherever a device is looked for.
+fn retired_devices_of(file: &JsonObject, device_id: &str) -> RetiredDevices {
+    let mut retired = RetiredDevices::new();
+    for (id, note) in obj(file, KEY_RETIRED_DEVICES).into_iter().flatten() {
+        let Some(note) = note.as_object() else {
+            continue;
+        };
+        let (Some(at), Some(revision_date)) = (int(note, "at"), string(note, KEY_REVISION_DATE))
+        else {
+            continue;
+        };
+        if is_safe_segment(id) && id != device_id {
+            let revision_date = revision_date.to_owned();
+            retired.insert(id.clone(), Retirement { at, revision_date });
+        }
+    }
+    retired
+}
+
+/// What the file of a device says that the device is, or `None` if it does not say so, as a file
+/// that an earlier client wrote does not. One that names another device is not about this one: a
+/// client that does not know the field takes it for part of the record of the account, and writes
+/// it in its own file with a change of the account, as it came in the file of another device.
+fn description_of(file: &JsonObject, device_id: &str) -> Option<DeviceDescription> {
+    let device = obj(file, KEY_DEVICE)?;
+    if string(device, "id") != Some(device_id) {
+        return None;
+    }
+    Some(DeviceDescription {
+        name: string(device, "name")?.to_owned(),
+        device_type: int(device, "type")?,
+    })
+}
+
+/// The devices whose files the vault is not put together from, as they were retired, with when the
+/// earliest of the notes that say so was made. A note counts as long as the file of the device is
+/// the one that was taken over or an earlier one (see [`Source::is_taken_over`]), in whichever file
+/// it is, the file of a device that was retired as well: the device that took over that file took
+/// the note over with it.
+///
+/// The file that took the file of the device over holds what it did, with the same stamps, so the
+/// vault is the same with it or without it. Every device that has the same files leaves out the
+/// same ones, whatever its clock says.
+pub(crate) fn left_out(files: &[Source]) -> BTreeMap<String, i64> {
+    let mut left_out = BTreeMap::new();
+    for file in files {
+        for (device_id, retirement) in &file.retired_devices {
+            let is_taken_over = files.iter().any(|retired| {
+                retired.device_id == *device_id && retired.is_taken_over(retirement)
+            });
+            if is_taken_over {
+                let at = left_out.entry(device_id.clone()).or_insert(retirement.at);
+                *at = retirement.at.min(*at);
+            }
+        }
+    }
+    left_out
+}
+
+/// The latest revision date, in milliseconds since the epoch, that a file of each device had when
+/// another device took it over, as the files that are not left out say: what a later file of the
+/// device holds since then is not part of the vault (see [`Source::not_taken_over`]). A note in a
+/// file that is left out does not count. The device that took that file over took the note over
+/// with it, but for one about itself: what the file that is left out took over from that device is
+/// held by that device alone then.
+///
+/// `left_out` are the devices whose files are left out (see [`left_out`]).
+pub(crate) fn taken_over_until(
+    files: &[Source],
+    left_out: &BTreeMap<String, i64>,
+) -> BTreeMap<String, i64> {
+    let mut until = BTreeMap::new();
+    let is_counted = |file: &&Source| !left_out.contains_key(&file.device_id);
+    for file in files.iter().filter(is_counted) {
+        for (device_id, retirement) in &file.retired_devices {
+            if let Some(taken_over) = parse_date_millis(&retirement.revision_date) {
+                let latest = until.entry(device_id.clone()).or_insert(taken_over);
+                *latest = taken_over.max(*latest);
+            }
+        }
+    }
+    until
+}
+
+/// The latest revision date, in milliseconds since the epoch, that a file of the device had when
+/// another device took it over, as any of the files says, those that are left out included. A file
+/// that the device writes has to be later than that, or it would be left out as well (see
+/// [`Source::is_taken_over`]), as one that it starts once its directory was deleted, or with a
+/// clock that is behind, could be.
+pub(crate) fn latest_taken_over<'a>(
+    files: impl IntoIterator<Item = &'a Source>,
+    device_id: &str,
+) -> Option<i64> {
+    let notes = files.into_iter();
+    let notes = notes.filter_map(|file| file.retired_devices.get(device_id));
+    let taken_over = notes.filter_map(|note| parse_date_millis(&note.revision_date));
+    taken_over.max()
+}
+
+/// Takes the file of a device that is retired over into the versions of this device: every
+/// version of it that is newer than the one that this device holds, with its stamp as it is, so
+/// that the vault stays the same and a newer version that another device wrote in the meantime
+/// still replaces it, but for those that it holds since a file of it that another device took over,
+/// the latest of which had the revision date `taken_over` (see [`Source::not_taken_over`]); the
+/// attachments that it removed, and the devices that it retired. Then notes that the device was
+/// retired at `at`, along with the revision date of its file, which tells that file from one that
+/// the device writes later.
+///
+/// The retired device may not have seen that an attachment that it removed came back, and was
+/// removed again later by a device that deletes the content 90 days after that. So the content
+/// is kept for 90 days from now, and an attachment that the vault has again is not taken over.
+///
+/// Of the notes of the devices that both retired, the one about the later file of that device is
+/// kept, or of two about the same file the earlier one (see [`Retirement::supersedes`]). A note
+/// about this device is not taken over: the device writes its file as it takes another one over,
+/// which makes the note one about an earlier file, and what the retired device took over from it
+/// is held by this device alone from then on (see [`taken_over_until`]).
+///
+/// `merged` are the versions that the vault is made of.
+pub(crate) fn take_over(
+    own: &mut Source,
+    own_device_id: &str,
+    retired: &Source,
+    taken_over: Option<i64>,
+    merged: &Versions,
+    at: i64,
+    now_millis: i64,
+) {
+    for (key, version) in retired.not_taken_over(taken_over).iter() {
+        offer(&mut own.versions, key, version.clone());
+    }
+    for (cipher_id, attachment_id) in retired.removed_attachments.keys() {
+        let cipher = cipher_in(merged, cipher_id);
+        if !cipher.is_some_and(|cipher| has_attachment(cipher, attachment_id)) {
+            let ids = (cipher_id.clone(), attachment_id.clone());
+            own.removed_attachments.entry(ids).or_insert(now_millis);
+        }
+    }
+    for (device_id, retirement) in &retired.retired_devices {
+        if device_id == own_device_id {
+            continue;
+        }
+        let held = own.retired_devices.get(device_id);
+        let is_held = held.is_some_and(|held| !retirement.supersedes(held));
+        if !is_held {
+            own.retired_devices
+                .insert(device_id.clone(), retirement.clone());
+        }
+    }
+    if let Some(revision_date) = retired.revision_date.as_str() {
+        let revision_date = revision_date.to_owned();
+        let retirement = Retirement { at, revision_date };
+        own.retired_devices
+            .insert(retired.device_id.clone(), retirement);
     }
 }
 
@@ -340,6 +677,26 @@ fn device_versions(file: &JsonObject, scope: Scope) -> Versions {
         }
     }
     versions
+}
+
+/// When the versions that were read from the file of a device came into it, as the stamps in its
+/// `records` and `tombstones` say (see [`KEY_CAME_IN`]).
+fn arrivals_of(file: &JsonObject, versions: &Versions) -> Arrivals {
+    let arrival = |key: &String, version: &Version| {
+        let stamps = if version.record.is_some() {
+            KEY_RECORDS
+        } else {
+            KEY_TOMBSTONES
+        };
+        let stamp = obj(file, stamps).and_then(|stamps| stamps.get(key));
+        let came_in = stamp.and_then(Value::as_object);
+        let came_in = came_in.and_then(|stamp| int(stamp, KEY_CAME_IN));
+        (key.clone(), (version.stamp.clone(), came_in))
+    };
+    versions
+        .iter()
+        .map(|(key, version)| arrival(key, version))
+        .collect()
 }
 
 /// The stamp of a folder or an item that the file of a device has no stamp for: when its revision
@@ -554,6 +911,12 @@ pub(crate) fn changes(
 /// it out, as no device writes the file of another. A tool that syncs the folder can bring the file
 /// without the version to a third device before the file that it was left to, which is why the
 /// version is held until every device has had time to get that one.
+///
+/// Nothing is put in the versions that none of the other files has: what is left out is held by
+/// another file or no longer needed, and a deletion that is put in place of a version is held by
+/// another file. Tidying thus never makes a file hold anything that would be lost without it, which
+/// is why a device that only tidies its file keeps its revision date (see [`left_out`]). This has to
+/// stay so.
 pub(crate) fn tidy(versions: &mut Versions, others: &[&Source], now_millis: i64) -> bool {
     let mut is_changed = false;
     for (key, version) in versions.iter_mut() {
@@ -923,8 +1286,14 @@ mod tests {
         let only_items = versions(vec![("cipher:d", version(1, "a", json!({"id": "D"})))]);
         let mut removed = RemovedAttachments::new();
         removed.insert(("C".to_owned(), "a1".to_owned()), 4);
+        let name = "Pixel 8".to_owned();
+        let description = DeviceDescription {
+            name,
+            device_type: 0,
+        };
         let device = Source {
             removed_attachments: removed.clone(),
+            description: Some(description.clone()),
             ..source("a", &written)
         };
 
@@ -935,14 +1304,27 @@ mod tests {
         assert_eq!(file["tombstones"]["folder:f"], json!({"at": 2, "by": "a"}));
         assert_eq!(file["removedAttachments"], json!({"C/a1": 4}));
         assert_eq!(file.get("since"), None);
+        let said = json!({"id": "a", "name": "Pixel 8", "type": 0});
+        assert_eq!(file["device"], said);
+        // It is not part of the record of the account, which is read back as it was written.
         let read = Source::device("a".to_owned(), &file, Scope::Vault);
         assert_eq!(read.removed_attachments, removed);
+        assert_eq!(read.description, Some(description));
         for key in ["account", "masterPassword", "cipher:c", "folder:f"] {
             assert_eq!(read.versions.get(key), written.get(key), "{key}");
         }
         let read_items = Source::device("a".to_owned(), &items_file, Scope::Vault);
         assert_eq!(read_items.versions, only_items);
         assert!(read_items.removed_attachments.is_empty());
+        assert_eq!(items_file.get("device"), None);
+        assert_eq!(read_items.description, None);
+        // Nor does the file of another device say what this one is, nor one that says it in part.
+        let read_other = Source::device("b".to_owned(), &file, Scope::Vault);
+        assert_eq!(read_other.description, None);
+        let mut without_type = file.clone();
+        without_type["device"] = json!({"id": "a", "name": "Pixel 8"});
+        let read_without_type = Source::device("a".to_owned(), &without_type, Scope::Vault);
+        assert_eq!(read_without_type.description, None);
     }
 
     #[test]
@@ -1224,5 +1606,340 @@ mod tests {
         let in_own_file = version(1, "a", json!({"id": "2", "folderId": "f"}));
         with_item.insert("cipher:2".to_owned(), in_own_file);
         assert_eq!(tidied(&with_item, &[], later), with_item);
+    }
+
+    const EARLIER: &str = "2026-10-11T11:00:00.000Z";
+    const NOON: &str = "2026-10-11T12:00:00.000Z";
+    const LATER: &str = "2026-10-11T13:00:00.000Z";
+
+    /// The file of a device, written at the date, that holds nothing.
+    fn file_of(device_id: &str, revision_date: &str) -> Source {
+        Source {
+            device_id: device_id.to_owned(),
+            revision_date: json!(revision_date),
+            ..Source::default()
+        }
+    }
+
+    fn retirement(at: i64, revision_date: &str) -> Retirement {
+        let revision_date = revision_date.to_owned();
+        Retirement { at, revision_date }
+    }
+
+    #[test]
+    fn the_versions_of_a_retired_device_that_are_newer_are_taken_over_with_their_stamps() {
+        let own = versions(vec![
+            ("cipher:1", version(2, "a", json!({"v": "a"}))),
+            ("cipher:2", version(1, "a", json!({"v": "a"}))),
+        ]);
+        let held = versions(vec![
+            ("cipher:1", version(1, "d", json!({"v": "d"}))),
+            ("cipher:2", version(3, "d", json!({"v": "d"}))),
+            ("cipher:3", deletion(4, "d")),
+            ("account", version(1, "d", json!({"v": "d"}))),
+        ]);
+        let mut taking = source("a", &own);
+        let retired = Source {
+            revision_date: json!(NOON),
+            ..source("d", &held)
+        };
+
+        take_over(
+            &mut taking,
+            "a",
+            &retired,
+            None,
+            &Versions::default(),
+            10,
+            20,
+        );
+
+        let all_keys = ["cipher:1", "cipher:2", "cipher:3", "account"];
+        assert_eq!(keys(&taking.versions), all_keys);
+        assert_eq!(taking.versions.get("cipher:1"), own.get("cipher:1"));
+        for key in ["cipher:2", "cipher:3", "account"] {
+            assert_eq!(taking.versions.get(key), held.get(key), "{key}");
+        }
+        let noted = BTreeMap::from([("d".to_owned(), retirement(10, NOON))]);
+        assert_eq!(taking.retired_devices, noted);
+    }
+
+    #[test]
+    fn a_master_password_that_another_device_replaced_is_not_kept_after_it_is_taken_over() {
+        let held = versions(vec![("masterPassword", version(1, "d", json!({"v": "d"})))]);
+        let newer = versions(vec![("masterPassword", version(2, "b", json!({"v": "b"})))]);
+        let mut taking = source("a", &Versions::default());
+        let retired = Source {
+            revision_date: json!(NOON),
+            ..source("d", &held)
+        };
+        let other = source("b", &newer);
+        let files = [&retired, &other];
+
+        take_over(
+            &mut taking,
+            "a",
+            &retired,
+            None,
+            &Versions::default(),
+            10,
+            20,
+        );
+        assert_eq!(keys(&taking.versions), ["masterPassword"]);
+        tidy(&mut taking.versions, &files, 20);
+
+        assert!(taking.versions.is_empty());
+    }
+
+    #[test]
+    fn the_devices_that_a_retired_device_retired_are_taken_over_but_not_this_one() {
+        let mut taking = file_of("a", LATER);
+        // Notes about earlier files of devices than those of the device that is retired, made later,
+        // and one about the same file, made later.
+        let held = [("x", 5, EARLIER), ("z", 7, EARLIER), ("w", 9, NOON)];
+        for (device_id, at, revision_date) in held {
+            let note = retirement(at, revision_date);
+            taking.retired_devices.insert(device_id.to_owned(), note);
+        }
+        let mut retired = file_of("d", LATER);
+        for (device_id, at, revision_date) in [
+            ("x", 3, NOON),
+            ("z", 6, NOON),
+            ("w", 8, NOON),
+            ("y", 2, NOON),
+            ("a", 4, EARLIER),
+        ] {
+            let note = retirement(at, revision_date);
+            retired.retired_devices.insert(device_id.to_owned(), note);
+        }
+
+        take_over(
+            &mut taking,
+            "a",
+            &retired,
+            None,
+            &Versions::default(),
+            10,
+            20,
+        );
+
+        // The note about the later file of the device, or of two about the same one the earlier.
+        let expected = BTreeMap::from([
+            ("d".to_owned(), retirement(10, LATER)),
+            ("w".to_owned(), retirement(8, NOON)),
+            ("x".to_owned(), retirement(3, NOON)),
+            ("y".to_owned(), retirement(2, NOON)),
+            ("z".to_owned(), retirement(6, NOON)),
+        ]);
+        assert_eq!(taking.retired_devices, expected);
+    }
+
+    #[test]
+    fn an_attachment_that_a_retired_device_removed_waits_90_days_from_when_it_is_taken_over() {
+        let ids = |cipher: &str, attachment: &str| (cipher.to_owned(), attachment.to_owned());
+        let mut retired = file_of("d", NOON);
+        for attachment in ["A1", "A2", "A3"] {
+            retired.removed_attachments.insert(ids("C", attachment), 1);
+        }
+        let mut taking = file_of("a", NOON);
+        taking.removed_attachments.insert(ids("C", "A3"), 5);
+        // The vault has the second one again.
+        let cipher = json!({"id": "C", "attachments": [{"id": "a2"}]});
+        let merged = versions(vec![("cipher:c", version(2, "b", cipher))]);
+
+        take_over(&mut taking, "a", &retired, None, &merged, 10, 20);
+
+        let expected = BTreeMap::from([(ids("C", "A1"), 20), (ids("C", "A3"), 5)]);
+        assert_eq!(taking.removed_attachments, expected);
+    }
+
+    #[test]
+    fn a_file_with_retired_devices_is_written_as_version_3_and_read_back() {
+        let written = versions(vec![("cipher:c", version(1, "a", json!({"id": "C"})))]);
+        let mut device = source("a", &written);
+        let plain = device.to_file();
+        let note = retirement(4, NOON);
+        device.retired_devices.insert("d".to_owned(), note);
+
+        let file = device.to_file();
+
+        assert_eq!(plain["version"], 2);
+        assert_eq!(plain.get("retiredDevices"), None);
+        assert_eq!(file["version"], 3);
+        let notes = json!({"d": {"at": 4, "revisionDate": NOON}});
+        assert_eq!(file["retiredDevices"], notes);
+        let read = Source::device("a".to_owned(), &file, Scope::Account);
+        assert_eq!(read.retired_devices, device.retired_devices);
+        // It is about the file, and not part of the record of the account.
+        let (account, _) = account_records(&file);
+        assert_eq!(account.get("retiredDevices"), None);
+        // Notes that are not complete, or that a device could not have written, are not read.
+        let mut odd = file;
+        odd["retiredDevices"] = json!({
+            "a": {"at": 4, "revisionDate": NOON},
+            "e": {"at": "4", "revisionDate": NOON},
+            "f": {"at": 4},
+            "g": {"at": 4, "revisionDate": 1},
+            "h.i": {"at": 4, "revisionDate": NOON},
+            "j": [4, NOON],
+        });
+        let read = Source::device("a".to_owned(), &odd, Scope::Vault);
+        assert!(read.retired_devices.is_empty());
+        // An ID in another case is that of another directory, and so of another device.
+        odd["retiredDevices"] = json!({"A": {"at": 4, "revisionDate": NOON}});
+        let read = Source::device("a".to_owned(), &odd, Scope::Vault);
+        let other = BTreeMap::from([("A".to_owned(), retirement(4, NOON))]);
+        assert_eq!(read.retired_devices, other);
+    }
+
+    #[test]
+    fn a_device_is_left_out_as_long_as_its_file_is_the_one_that_was_taken_over_or_an_earlier_one() {
+        let mut a = file_of("a", LATER);
+        for device_id in ["d", "f", "g"] {
+            let note = retirement(5, NOON);
+            a.retired_devices.insert(device_id.to_owned(), note);
+        }
+        a.retired_devices
+            .insert("e".to_owned(), retirement(5, EARLIER));
+        a.retired_devices
+            .insert("h".to_owned(), retirement(5, "noon"));
+        let mut b = file_of("b", LATER);
+        b.retired_devices
+            .insert("d".to_owned(), retirement(3, NOON));
+        // The device was retired from a file that it wrote before the one that it has now, and a
+        // file that does not say when it was written is never the one that was taken over.
+        let d = file_of("d", NOON);
+        let e = file_of("e", NOON);
+        let f = Source {
+            device_id: "f".to_owned(),
+            ..Source::default()
+        };
+        // A copy of the directory from before the file that was taken over, as from a backup, and a
+        // file whose revision date is not a date, as the note says.
+        let g = file_of("g", EARLIER);
+        let h = file_of("h", "noon");
+
+        let retired = left_out(&[a, b, d, e, f, g, h]);
+
+        let expected = [("d", 3), ("g", 5), ("h", 5)];
+        let expected = expected.map(|(device_id, at)| (device_id.to_owned(), at));
+        assert_eq!(retired, BTreeMap::from(expected));
+    }
+
+    #[test]
+    fn the_file_of_a_device_says_when_each_version_came_into_it() {
+        let noon = parse_date_millis(NOON).unwrap();
+        let later = parse_date_millis(LATER).unwrap();
+        let written = versions(vec![
+            ("cipher:1", version(1, "a", json!({"id": "1"}))),
+            ("cipher:2", version(2, "a", json!({"id": "2"}))),
+            ("folder:f", deletion(3, "b")),
+        ]);
+        let mut device = file_of("a", NOON);
+        device.versions = written;
+        let mut file = device.to_file();
+        let first = json!({"at": 1, "by": "a", "in": noon});
+        assert_eq!(file["records"]["cipher:1"], first);
+        assert_eq!(file["tombstones"]["folder:f"]["in"], noon);
+        // An earlier client did not say it of the second item.
+        file["records"]["cipher:2"] = json!({"at": 2, "by": "a"});
+
+        // The file is written again later, with a new version of the first item and a new one.
+        let mut read = Source::device("a".to_owned(), &file, Scope::Vault);
+        let first = version(4, "a", json!({"id": "1"}));
+        read.versions.insert("cipher:1".to_owned(), first.clone());
+        let new = version(5, "a", json!({"id": "3"}));
+        read.versions.insert("cipher:3".to_owned(), new);
+        read.revision_date = json!(LATER);
+        let file = read.to_file();
+
+        assert_eq!(file["records"]["cipher:1"]["in"], later);
+        assert_eq!(file["records"]["cipher:2"], json!({"at": 2, "by": "a"}));
+        assert_eq!(file["records"]["cipher:3"]["in"], later);
+        assert_eq!(file["tombstones"]["folder:f"]["in"], noon);
+        let read = Source::device("a".to_owned(), &file, Scope::Vault);
+        assert_eq!(read.versions["cipher:1"], first);
+    }
+
+    #[test]
+    fn what_a_file_holds_since_one_of_its_device_that_was_taken_over_is_not_counted() {
+        let dates = [EARLIER, NOON, LATER].map(|date| parse_date_millis(date).unwrap());
+        let [earlier, noon, later] = dates;
+        let mut file = file_of("d", LATER);
+        file.versions = versions(vec![
+            // Held since a file that was taken over, or since a later one.
+            ("cipher:1", version(earlier, "d", json!({"id": "1"}))),
+            ("cipher:2", version(earlier, "d", json!({"id": "2"}))),
+            // A version of another device that came into the file later, and one that this device
+            // wrote later with a clock that was behind.
+            ("cipher:3", version(earlier, "x", json!({"id": "3"}))),
+            ("cipher:4", version(earlier, "d", json!({"id": "4"}))),
+            // Versions that an earlier client did not say when they came in of: one that the
+            // device wrote before the file that was taken over, one of another device, and one
+            // that the device wrote later.
+            ("cipher:5", version(noon, "d", json!({"id": "5"}))),
+            ("cipher:6", version(earlier, "x", json!({"id": "6"}))),
+            ("cipher:7", version(later, "d", json!({"id": "7"}))),
+        ]);
+        let came_in = [
+            ("cipher:1", Some(earlier)),
+            ("cipher:2", Some(later)),
+            ("cipher:3", Some(later)),
+            ("cipher:4", Some(later)),
+            ("cipher:5", None),
+            ("cipher:6", None),
+            ("cipher:7", None),
+        ];
+        for (key, came_in) in came_in {
+            let stamp = file.versions[key].stamp.clone();
+            file.arrivals.insert(key.to_owned(), (stamp, came_in));
+        }
+
+        let counted = file.not_taken_over(Some(noon));
+
+        let counted_keys = ["cipher:2", "cipher:3", "cipher:4", "cipher:6", "cipher:7"];
+        assert_eq!(keys(&counted), counted_keys);
+        assert_eq!(keys(&file.not_taken_over(None)).len(), 7);
+        // A device that retires it does not take over what it holds since then either.
+        let mut taking = file_of("a", LATER);
+        take_over(
+            &mut taking,
+            "a",
+            &file,
+            Some(noon),
+            &Versions::default(),
+            10,
+            20,
+        );
+        assert_eq!(keys(&taking.versions), counted_keys);
+    }
+
+    #[test]
+    fn a_note_in_a_file_that_is_left_out_does_not_count_for_what_a_later_file_holds() {
+        let mut a = file_of("a", LATER);
+        a.retired_devices
+            .insert("d".to_owned(), retirement(5, EARLIER));
+        a.retired_devices
+            .insert("b".to_owned(), retirement(5, NOON));
+        let mut b = file_of("b", NOON);
+        for device_id in ["a", "d"] {
+            let note = retirement(4, NOON);
+            b.retired_devices.insert(device_id.to_owned(), note);
+        }
+        let files = [a, b, file_of("d", LATER)];
+        let left_out = left_out(&files);
+
+        let until = taken_over_until(&files, &left_out);
+
+        // The notes of the file that is left out, about the device that took it over and another
+        // one, do not count.
+        assert_eq!(left_out.keys().collect::<Vec<_>>(), ["b"]);
+        let [earlier, noon] = [EARLIER, NOON].map(|date| parse_date_millis(date).unwrap());
+        let expected = [("b", noon), ("d", earlier)];
+        let expected = expected.map(|(device_id, until)| (device_id.to_owned(), until));
+        assert_eq!(until, BTreeMap::from(expected));
+        assert_eq!(latest_taken_over(&files, "d"), Some(noon));
+        assert_eq!(latest_taken_over(&files, "a"), Some(noon));
+        assert_eq!(latest_taken_over(&files, "x"), None);
     }
 }

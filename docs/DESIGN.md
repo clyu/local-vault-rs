@@ -96,9 +96,11 @@ upstream (see [The approach](#the-approach)).
 | The route table and the handlers of the identity, account and vault requests | |
 | The vault store: the layout of the vault folder, the vault put together from the files of every device, and writes that never leave a device without a complete file | The file system that reaches the vault folder: six operations |
 | The directory that a device writes in | The ID of its installation, which is the same every time it starts |
+| What the files of a device say that it is | The name and the type of its device, as it names them to a Bitwarden server |
 | The media type of a response, and the error body for a call that fails unexpectedly | Turns the response into one of its HTTP client |
 | Where the content of an attachment is stored, and which file a download is | Stores and reads that content, if it streams it |
 | Which accounts a vault folder does not have yet, and what it does not have yet of the others: the files of the device, and the content of attachments | Copies them when the vault moves to another folder |
+| Which devices have a file in the vault of an account, and retiring one that is gone for good: taking its file over, leaving it out, deleting its directory 90 days later | Lists them, and retires the one that the user chooses (`GET local-vault/devices`, `POST local-vault/devices/{id}/retire`) |
 | The rules that a client checks itself against | Its tests that check them |
 
 ### The local server
@@ -142,6 +144,12 @@ master password hint (`ClientKind`), as each client shows the message of another
 does differently for each device is where it writes: a client gives its local server the ID of
 its installation when it creates it, and the local server writes in a directory named after it.
 
+The paths under `local-vault` are not those of the Bitwarden API: they are what only the clients of
+the local vault ask for, which a Bitwarden server does not have, and are answered the same way as
+any other request, under the same lock. They are the devices that have a file in the vault of an
+account, and retiring one of them (see [The vault store](#the-vault-store)). A client asks for
+them as it asks for anything else, so that it needs nothing besides its requests to reach them.
+
 ### The content of attachments
 
 The content of an attachment can be large, and a client may have it as a stream. There are two
@@ -169,7 +177,9 @@ device. It is the only code that knows the file layout, and it guarantees five t
 
 - A device only ever writes its own files, apart from `vault.json` of an account, which says
   which layout the account has, or that the account was deleted, and is the same on every
-  device. A tool that syncs the folder never has to choose between two versions of a file.
+  device. A tool that syncs the folder never has to choose between two versions of a file. The
+  only files of another device that a device deletes are those of one that was retired 90 days
+  ago or longer (see below).
 - A write never leaves a device without a complete file: the new content goes to a temporary
   file, the old file becomes the backup, and the temporary file takes its place.
 - A change that is made after another one is newer than that one, even where the clock of the
@@ -211,6 +221,38 @@ content of an item whose file has not come yet. The content is deleted file by f
 directory that held the content of an item only once it is empty, and only if the vault does not
 have the item: a directory is deleted with everything in it, and the content of a new attachment
 of an item that the vault has can be on its way to it.
+
+A device that is gone for good never leaves anything out of its file, which would keep the
+deletions of the records that it holds older versions of, the content of the attachments that it
+removed and the master password of its time in the folder for good. Another device retires it:
+it takes the file over into its own, every version that is newer than its own with its stamp as
+it is, and notes that it did, along with the revision date of that file (`merge::take_over`).
+Every device that has the note leaves that file out of the vault right away, whatever its clock
+says, as the vault is the same without it, and so does it with every earlier file of that device,
+such as its backup, or a copy of its directory from a backup (`merge::left_out`). A device writes
+each file with a change later than every one before it, and later than every note about it, so a
+note is never about a file that it wrote since. Such a later file still holds what the file that
+was taken over held, which every device that has the note leaves out of the vault as well: a stamp
+in the file of a device says when the version came into that file, and what came in with the file
+that was taken over or before is held by the device that took it over, or was replaced
+(`merge::Source::not_taken_over`). Otherwise a device that was retired, but is still in use, would
+bring back the items whose deletions were forgotten since with its next change, as it does not know
+that it was retired before the note comes to it, which can be after its directory was deleted, if it
+was not used for long. For 90 days, the time that the note
+can take to come to every device, the file still counts when a device looks for what it no
+longer has to hold, as a device that does not have the note yet puts the vault together from it,
+and the device that was retired still writes its file from it, should it be still in use: the next
+time that it tidies, at a sync a day or more after it last did, or its next change of the vault,
+gives its file a later revision date, which the note is not about, and it is not retired anymore.
+Then the first device that tidies deletes the directory, as long as its `vault.json` is the file
+that the note is about, and not one that a file that stands in for it, such as the backup, is taken
+for while the newer one has not fully come. It deletes `vault.json` last: a deletion that stops
+before it is done then leaves that file, and the directory is deleted the next time, where a file
+that stands in for `vault.json`, left on its own, would keep it for good. A device whose
+`vault.json` never comes complete, as one that stopped for good while it wrote it, can therefore
+never be retired. The file of a device that retired another one is of version 3, so that a client
+that does not know of retired devices takes the account for one of a layout that it does not know,
+rather than put the vault together from the files that were retired.
 
 A device can also have the `vault.json` that says that an account has this layout, or the file
 of another device, before any file with the record of the account: that of the device that
@@ -312,6 +354,7 @@ a newer one of the device that wrote it.
 | Sell premium | Every account is reported as premium. |
 | Report feature flags | None are reported. |
 | Push changes to other devices | Nothing is pushed. A device finds out about a change the next time it syncs. |
+| List the devices of an account, and remove one | `GET devices` is an empty list, as nothing is registered per device. The devices that have a file in the vault of an account are listed under `local-vault` instead, where one that is gone for good is retired: the device that retires it takes its file over, and its directory is deleted 90 days later. |
 
 ## Making sure nothing reaches a real server
 
@@ -411,8 +454,9 @@ file system and the setting for the vault folder. A workable order:
 1. **Find the one place that all requests to Bitwarden pass through**, and hand the requests for
    `vault.local.invalid` to the local server there, in the same process, as they are. Check for a
    second path that bypasses it, such as requests that the SDK makes by itself.
-2. **Give the local vault the file system of the client** and the ID of its installation, and
-   run `check_file_system` against the file system. Test it against a vault folder that another
+2. **Give the local vault the file system of the client**, the ID of its installation, and the
+   name and the type that it names its device by to a Bitwarden server, and run
+   `check_file_system` against the file system. Test it against a vault folder that another
    client created.
 3. **Turn the responses into those of the HTTP client**, with their media type, and choose
    whether the content of attachments is streamed or buffered.
@@ -432,7 +476,11 @@ file system and the setting for the vault folder. A workable order:
    they give it in, and nothing else, which never overwrites an account that the folder already
    has (see [Moving the vault to another folder](#moving-the-vault-to-another-folder)). It calls
    them rather than holding a copy of them, and does only the copying, as a stream.
-8. **Test with two clients on one folder**: register on one and log in on the other, change an
+8. **Add the page that lists the devices of the vault**, from `GET local-vault/devices`, by their
+   names and their types: a device that only reads the vault has not changed it for a long time
+   either, as one that is gone for good. It retires the one that the user chooses with
+   `POST local-vault/devices/{id}/retire`, and says when its directory is deleted.
+9. **Test with two clients on one folder**: register on one and log in on the other, change an
    item on both, and change the master password on one to see the other log out. Then change the
    KDF settings on one and the master password on the other, without locking the other in
    between, and the settings and then the master password on one client, without locking it
@@ -451,16 +499,37 @@ file system and the setting for the vault folder. A workable order:
   installations have, they write different files.
 - **The directory of a device must not be deleted by hand.** Part of the vault may only be in
   it. A device that is gone for good leaves its directory behind, which is read along with the
-  others.
+  others, until another device retires it.
+- **Retiring a device takes 90 days.** Its file is left out of the vault at once, but its directory
+  is deleted only 90 days later, and keeps what it held until then, the master password of its time
+  included. A device that is still in use is not retired for long, as it writes its file again when
+  it syncs, a day after it last tidied its file at the latest. Only one that syncs or changes the
+  vault for the first time since it was retired after its directory was deleted elsewhere, before
+  that comes to it, such as one that was not used for long, writes its file in a directory that was
+  deleted: depending on the tool that syncs the folder, the change is lost, or the file comes back,
+  with the master password of its time until the files of the other devices come to it. What the
+  file held when it was taken over is left out of the vault. A file that an earlier client wrote
+  does not say when its versions came into it, though: what such a device took over from another
+  one before it was retired then counts, which can bring back items whose deletions were forgotten
+  in the meantime, and what it wrote later with a clock that was behind does not.
+- **A device that stopped for good while it wrote its file cannot be retired.** Retiring needs
+  the `vault.json` of the device to be complete, as a file that stands in for it can be older than
+  one that has not fully come yet. A device that stopped between the renames of a write, or whose
+  `vault.json` a tool that syncs the folder damaged, and that is not used again, keeps its
+  directory and what it holds for good, as a device that is gone for good did before devices could
+  be retired. Retiring it fails, and keeps saying to try again later.
+- **A client that is not updated cannot use an account once a device of it was retired.** The
+  file of the device that retired it has a layout that such a client does not know, which it
+  neither uses nor writes until it is updated.
 - **Changing the master password does not lock out whoever knows the old one.** Nothing changes
   the user key, and the user key encrypted with the old master key stays in the folder: a device
   leaves the older master password out of its file only the next time that it syncs or
   changes the vault, the backup of the file keeps it until the file is written again, and the
   directory of a device that is gone for good, such as that of a browser extension that was
-  installed again, keeps it for good. Whoever has the old master password and a copy of the
-  folder can therefore decrypt the vault, items added after the change included. If the master
-  password may be known to someone else, export the vault, import it into a new account, and
-  delete the old account, which deletes the files of every device.
+  installed again, keeps it until 90 days after the device is retired. Whoever has the old master
+  password and a copy of the folder can therefore decrypt the vault, items added after the change
+  included. If the master password may be known to someone else, export the vault, import it into
+  a new account, and delete the old account, which deletes the files of every device.
 - **Stronger KDF settings do not protect what the folder held before.** The user key encrypted
   with the master key of the settings from before stays in the folder in the same places as after
   a change of the master password, and is in every copy of the folder from before the change: the
@@ -494,8 +563,9 @@ file system and the setting for the vault folder. A workable order:
   that a change of another device can still bring the attachment back. A change that comes later
   than that brings the attachment back without its content.
 - **Files of attachments can be left behind.** The content of an attachment that a device
-  removed stays in the folder if that device is gone for good, and goes to every device that
-  shares the folder. Nothing looks for files that no item refers to. An item that the vault
+  removed stays in the folder if that device is gone for good, until another device retires it
+  and deletes the content 90 days after that, and goes to every device that shares the folder in
+  the meantime. Nothing looks for files that no item refers to. An item that the vault
   still has keeps the directory of the content of its attachments once the last of them is
   gone, empty.
 - **A deleted account leaves its directory behind**, with the `vault.json` that says that it was

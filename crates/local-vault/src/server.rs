@@ -11,6 +11,7 @@ use crate::http::{
     list_response, ok_empty_response, ok_response, unauthorized_response, unsupported_response,
 };
 use crate::json::{JsonObject, is_safe_segment, with_fields};
+use crate::merge::DeviceDescription;
 use crate::platform::{LogLevel, Platform, new_uuid};
 use crate::store::{KEY_REVISION_DATE, LocalVaultStore, ReadError, ReadVault, as_strs};
 use crate::token::user_id_of_access_token;
@@ -194,6 +195,8 @@ enum AccountRoute<'a> {
     UpdateKdf,
     RecordUserKeyId,
     DeleteAccount,
+    LocalVaultDevices,
+    RetireLocalVaultDevice(&'a str),
     /// A request that there is nothing to do for, which is answered with this value.
     Constant(Value),
     /// A request for a list that is always empty here.
@@ -204,24 +207,36 @@ enum AccountRoute<'a> {
 
 impl<F: FileSystem, P: Platform> LocalServer<F, P> {
     /// A local server on the vault folder that the file system reaches, for the device with the
-    /// ID.
+    /// ID, the name and the type.
     ///
     /// The ID is that of this installation of the client, such as the UUID that it identifies
     /// itself to a Bitwarden server with, and is the same every time. It names the directory
     /// that the device writes its changes to, which no other device writes: it is made of 1 to
     /// 128 ASCII letters, digits, `-` and `_`. Fails for any other ID, as the local server could
     /// write nothing with it: every request that changes the vault would fail.
+    ///
+    /// The name and the type are what the client names the device to a Bitwarden server as it
+    /// logs in (`deviceName` and `deviceType`): the model of a phone, or the browser that an
+    /// extension is in, and the number of the kind of the device in the Bitwarden API
+    /// (`DeviceType`). The files of the device say them, so that the devices that share the vault
+    /// folder can be told apart.
     pub fn new(
         file_system: F,
         platform: P,
         client: ClientKind,
         device_id: &str,
+        device_name: &str,
+        device_type: i64,
     ) -> Result<Self, IoError> {
         if !is_safe_segment(device_id) {
             return Err(IoError::new(DEVICE_ID_MESSAGE));
         }
+        let description = DeviceDescription {
+            name: device_name.to_owned(),
+            device_type,
+        };
         Ok(Self {
-            store: LocalVaultStore::new(file_system, device_id),
+            store: LocalVaultStore::new(file_system, device_id, description),
             platform,
             client,
             state: Mutex::new(State::default()),
@@ -398,6 +413,10 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
             R::UpdateKdf => self.update_kdf(user_id, vault, request).await,
             R::RecordUserKeyId => self.record_user_key_id(user_id, vault, request).await,
             R::DeleteAccount => self.delete_account(user_id, vault, request).await,
+            R::LocalVaultDevices => self.local_vault_devices(user_id).await,
+            R::RetireLocalVaultDevice(device_id) => {
+                self.retire_local_vault_device(user_id, device_id).await
+            }
             R::Constant(value) => Ok(ok_response(&value)),
             R::EmptyList => Ok(list_response(Vec::new())),
             R::Empty => Ok(ok_empty_response()),
@@ -483,7 +502,7 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
     /// so an account whose vault cannot be used for now is logged with its ID, which is the name
     /// of its directory in the vault folder: the files of an account can keep from coming for
     /// good, and the directory then has to be found to be deleted by hand.
-    fn reported<T>(&self, read: Result<T, ReadError>) -> Result<T, IoError> {
+    pub(crate) fn reported<T>(&self, read: Result<T, ReadError>) -> Result<T, IoError> {
         read.map_err(|error| match error {
             ReadError::Io(error) => error,
             ReadError::Unusable(account_id, why) => {
@@ -533,6 +552,9 @@ fn public_route(method: &str, path: &[&str]) -> Option<PublicRoute> {
 /// Returns what answers a request that is made as an account, or `None` if there is no route
 /// for it. An item or a folder is only taken to be named in a path by a UUID, which keeps
 /// requests such as `DELETE ciphers/admin` from being taken for one.
+///
+/// The paths under `local-vault` are those of what only the clients of the local vault ask for,
+/// which a Bitwarden server does not have: the devices that share the vault folder.
 fn account_route<'a>(method: &str, path: &[&'a str]) -> Option<AccountRoute<'a>> {
     use AccountRoute as R;
     let route = match (method, path) {
@@ -579,6 +601,10 @@ fn account_route<'a>(method: &str, path: &[&'a str]) -> Option<AccountRoute<'a>>
         ("POST", ["accounts", "kdf"]) => R::UpdateKdf,
         ("POST", ["accounts", "key-management", "user-key-id"]) => R::RecordUserKeyId,
         ("DELETE", ["accounts"]) => R::DeleteAccount,
+        ("GET", ["local-vault", "devices"]) => R::LocalVaultDevices,
+        ("POST", ["local-vault", "devices", device_id, "retire"]) => {
+            R::RetireLocalVaultDevice(device_id)
+        }
         ("GET", ["auth-requests"]) => R::EmptyList,
         ("GET", ["auth-requests", "pending"]) => R::EmptyList,
         ("GET", ["devices"]) => R::EmptyList,

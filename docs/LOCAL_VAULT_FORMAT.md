@@ -51,6 +51,8 @@ The ID of a device is that of the installation of the client, which is the same 
 it starts and is never the one of another installation: the UUID that the Android app identifies
 itself to a Bitwarden server with, and one that the browser extension keeps for the local vault.
 The directory of a device must not be deleted by hand: part of the vault may be in no other file.
+A device that is gone for good is retired instead, which deletes its directory once nothing is lost
+with it (see [Retiring a device](#retiring-a-device)).
 
 IDs are UUIDs. A name that is not made of letters, digits, `-` and `_` only is never used as the
 name of a file or a directory.
@@ -111,23 +113,24 @@ it takes it for a layout that it does not know, which it does not use or write.
   },
   "sync": { /* the body of the Bitwarden API response to GET /sync, as far as the device holds it */ },
   "records": {
-    "account": {"at": 1791720000000, "by": "<device id>"},
-    "masterPassword": {"at": 1791720000000, "by": "<device id>"},
-    "cipher:<id>": {"at": 1791720000000, "by": "<device id>"}
+    "account": {"at": 1791720000000, "by": "<device id>", "in": 1791720000000},
+    "masterPassword": {"at": 1791720000000, "by": "<device id>", "in": 1791720000000},
+    "cipher:<id>": {"at": 1791720000000, "by": "<device id>", "in": 1791720000000}
   },
   "tombstones": {
-    "folder:<id>": {"at": 1791720000000, "by": "<device id>"}
+    "folder:<id>": {"at": 1791720000000, "by": "<device id>", "in": 1791720000000}
   },
   "removedAttachments": {
     "<cipher id>/<attachment id>": 1791720000000
-  }
+  },
+  "device": {"id": "<device id>", "name": "Pixel 8", "type": 0}
 }
 ```
 
 | Field | Meaning |
 |-------|---------|
 | `format` | Always `bitwarden-local-vault`. A file with another value is not a vault. |
-| `version` | The version of this layout, `2`. A file with a version that a client does not know must be left alone. |
+| `version` | The version of this layout, `2`, or `3` for the file of a device that retired another one: see [Retiring a device](#retiring-a-device). A file with a version that a client does not know must be left alone. |
 | `revisionDate` | When the device last changed the vault, as an ISO-8601 date in UTC. |
 | `since` | Earlier clients wrote when the device first wrote the file. Nothing reads it, and it is left out when the file is written again. |
 | `account` | What a server keeps to itself about the account. |
@@ -135,6 +138,8 @@ it takes it for a layout that it does not know, which it does not use or write.
 | `records` | The stamp of every record that the file holds. |
 | `tombstones` | The stamp of every deletion that the file holds. |
 | `removedAttachments` | The attachments that the device removed from the vault and has yet to delete the content of, by the IDs of the item and of the attachment as the vault had them, with when it removed them, in milliseconds since the epoch: see [The content of attachments](#the-content-of-attachments). A file without it has none. |
+| `retiredDevices` | The devices that the device retired, by their IDs: when it retired each of them, in milliseconds since the epoch (`at`), and the `revisionDate` of the file of that device that it took over (`revisionDate`), as in `{"<device id>": {"at": 1791720000000, "revisionDate": "2026-10-11T12:00:00.000Z"}}`. Only a file of version 3 has it: see [Retiring a device](#retiring-a-device). |
+| `device` | What the device is, as its client names it to a Bitwarden server when it logs in, so that the user can tell the devices that share the vault folder apart: the ID of the device (`id`), its `name`, such as the model of a phone or the browser that an extension is in, and its `type`, the number of its kind of device in the Bitwarden API (`DeviceType`), such as `0` for Android and `2` for an extension in Chrome. A file whose `device` has another `id`, or no `name` or `type`, does not say what its device is: a client that does not know the field takes it for part of the record of the account, and writes it in its own file with a change of the account, as it came in the file of another device. Nor does a file without it, as earlier clients wrote. |
 
 ### Records and stamps
 
@@ -148,11 +153,11 @@ whole: the verifier, the user key encrypted with the master key, the parameters 
 key is derived with and the security stamp are never taken from two different versions. The
 record of the account is everything else in the file but `sync.folders`, `sync.ciphers` and the
 fields that are about the file (`format`, `version`, `revisionDate`, `since`, `records`,
-`tombstones` and `removedAttachments`). The two are records of their own, so that a change of the
-account that a device makes before the newest master password has come to it, such as recording
-the ID of the user key, does not bring an older master password back. A folder and an item are
-records of their own. A record has a key: `masterPassword`, `account`, `folder:<id>` or
-`cipher:<id>`, with the ID in lower case.
+`tombstones`, `removedAttachments`, `retiredDevices` and `device`). The two are records of their
+own, so that a change of the account that a device makes before the newest master password has come
+to it, such as recording the ID of the user key, does not bring an older master password back. A
+folder and an item are records of their own. A record has a key: `masterPassword`, `account`,
+`folder:<id>` or `cipher:<id>`, with the ID in lower case.
 
 A file holds the versions of the records that its device wrote and that it does not leave to
 another device yet, and the deletions of other devices that it put in place of such versions (see
@@ -166,6 +171,14 @@ device (`by`). Of two versions of a record, the one with the later `at` is the n
 two with the same `at`, the one whose `by` comes later, compared as strings by their UTF-16 code
 units. A folder or an item in `sync` that `records` has no stamp for is taken to have been written
 at its `revisionDate`, or else at the `revisionDate` of the file, by no device (`""`).
+
+A stamp in the file of a device also says when the version came into that file (`in`): the
+`revisionDate` that the file had when the device first wrote it with the version, in milliseconds
+since the epoch. It is about the file, and not the version: a device that takes a version over from
+another file gives it the `revisionDate` of its own. It tells what a file holds since a file of its
+device that another device took over from what came into it later (see
+[Retiring a device](#retiring-a-device)). Earlier clients did not write it, and a stamp without it
+is kept without it.
 
 ### JSON
 
@@ -242,19 +255,27 @@ The vault of an account is put together from all of its files, the same way on e
    [The earlier layout](#the-earlier-layout)). Only a `vault.json` of the account whose `format`
    is not `bitwarden-local-vault`, such as the one that says that the account was deleted, means
    that there is no account.
-4. Take the newest version of each record, and of versions that are as new, the first one that
+4. Leave out the file of every device that was retired: one that a note in `retiredDevices` of one
+   of the files, a file that is left out included, says was taken over, as the `revisionDate` of
+   the file is the one that the note has, or earlier (see [Retiring a device](#retiring-a-device)).
+   The device that took it over holds what it held, so the vault is the same without it. A file
+   that is left out has still come, for what follows. Of the file of a device that a note in a
+   file that is not left out is about, and that is not left out itself, leave out the versions that
+   it holds since the file that the latest such note is about: the device that took that file over
+   holds them, or what replaced them.
+5. Take the newest version of each record, and of versions that are as new, the first one that
    was read. A record whose newest version is a deletion is not in the vault.
-5. The vault is the record of the account, with the fields of the record of the master password
+6. The vault is the record of the account, with the fields of the record of the master password
    in their places, the folders in `sync.folders` and the items in `sync.ciphers` in the order
    that they were first read in. An account without a record of the account, or without one of
    its master password, is on its way if its `vault.json` says that it has this layout, or if the
    file of a device has come: the file that holds the record has not come yet (see below).
    Otherwise the account is not there.
-6. An item whose `folderId` names a folder that was deleted is in no folder, as one device can
+7. An item whose `folderId` names a folder that was deleted is in no folder, as one device can
    delete a folder while another one puts an item in it. For the same reason, deleting a folder
    leaves the items in it as they are: as new versions of them, it would replace a change of one
    of them that another device made before the deletion came to it.
-7. The `revisionDate` of the vault is the latest of those of the files.
+8. The `revisionDate` of the vault is the latest of those of the files that are not left out.
 
 Every device that has the same files comes to the same vault.
 
@@ -289,9 +310,17 @@ A client that changes a vault writes the file of its own device, and no other:
 3. Read the files of the devices again, as the file of another device may have come in since.
    The new file of the device is the versions that it holds, with the new ones in place of those
    of the same records, without what it no longer has to hold (see below), and with
-   `revisionDate` set to the current time. Its `removedAttachments` are those of the file that it
+   `revisionDate` set to the current time, or to one millisecond after the `revisionDate` of the
+   file that it replaces, or after the latest `revisionDate` that a note about the device in
+   `retiredDevices` of one of the files has, whichever is latest: each file that a device writes
+   with a change is later than every one before it, which a note that a file was taken over goes
+   by (see [Retiring a device](#retiring-a-device)). The stamp of every version that it did not
+   hold with the same stamp before has that `revisionDate` as `in`, and the others keep theirs.
+   Its `removedAttachments` are those of the file that it
    replaces, with every attachment that the change took out of the vault added at the current
-   time: one that an item no longer has, and those of an item that was deleted.
+   time: one that an item no longer has, and those of an item that was deleted. Its
+   `retiredDevices` are those of the file that it replaces, and its `device` says what the device
+   is now.
 4. Write the new file to `vault.json.tmp` of the directory of the device, delete
    `vault.json.bak`, rename `vault.json` to `vault.json.bak`, and rename `vault.json.tmp` to
    `vault.json`.
@@ -387,12 +416,17 @@ it leaves the version out as above. Of the deletions of several devices, it puts
 A device that does not change the vault looks for these at most once a day, when its client
 syncs, and again at the next sync if it could not, along with the content of the attachments
 that it removed (see
-[The content of attachments](#the-content-of-attachments)), and writes its file if it finds any.
-The vault stays the same.
+[The content of attachments](#the-content-of-attachments)) and the directories of the devices
+that were retired long enough ago (see [Retiring a device](#retiring-a-device)), and writes its
+file if it finds any, if it was retired itself, or if its file does not say what the device is now,
+as one that an earlier client wrote does not: a device that only reads the vault would otherwise
+never say so. The vault stays the same.
 
 Only the device that a file belongs to leaves anything out of it. A version that a device holds
 is therefore in the file of another device before it leaves that file, unless the directory of
-that other device is deleted, which is why that must not be done by hand. A third device can get
+that other device is deleted, which is why that must not be done by hand: only the directory of a
+device that was retired is deleted, once another device took its file over and every device has
+had time to learn it (see [Retiring a device](#retiring-a-device)). A third device can get
 the file without the version before the file with the newer one, as a tool that syncs the folder
 brings them in no particular order. The 90 days are for that: by then, the newer one has come to
 every device, and a device that gets the file without the version still has the record, as it
@@ -410,9 +444,107 @@ was before the change or as it is now. Two versions are not held that long nonet
   password replaced, which is not kept longer than it has to be. A device that does not have the
   newer one yet has no vault to use until it comes (see
   [Putting the vault together](#putting-the-vault-together)), or takes an older one that another
-  file still has, such as that of a device that is gone for good, for the master password until
-  then. An older version of the record of the account holds nothing of the kind, and is left out
-  as any other one.
+  file still has, such as that of a device that is gone for good and was not retired, for the
+  master password until then. An older version of the record of the account holds nothing of the
+  kind, and is left out as any other one.
+
+## Retiring a device
+
+A device that is gone for good, such as a browser extension that was installed again, and writes
+the directory of another ID since, never leaves anything out of its file again. As long as the file
+is there, the deletions of the records that it holds older versions of are kept, as is that of a
+folder that it has an item in, the content of the attachments that it removed is never deleted,
+and the file keeps the master password of its time. Its directory must not be deleted by hand, as
+part of the vault may be in no other file. A device that is still used retires it instead:
+
+1. Read the files of the devices, as for a change of the vault. A device whose `vault.json` is not
+   complete, such as one whose newer file has not fully come, or whose file has no `revisionDate`,
+   is not retired: the file that stands in for it can be an older one. A device whose `vault.json`
+   never comes complete, as that of one that stopped for good while it wrote it, between the
+   renames of step 4 of [Changing a vault](#changing-a-vault), or one that a tool that syncs the
+   folder damaged, can therefore never be retired. It stays a device that is gone for good: its
+   directory is read along with the others, and keeps what it holds, as above.
+2. Take its file over into the file of the device: every version of a record in it that is newer
+   than the one that the file of the device holds, with its stamp as it is, but for those that it
+   holds since a file of it that another device took over (see below). The vault stays the same,
+   and a newer version that another device wrote in the meantime still replaces it. Its
+   `removedAttachments` are taken over as well, at the current time, but not the attachments that
+   the vault has again: the device may not have seen that one that it removed came back, and was
+   removed again later by another device, which deletes the content 90 days after that. So are its
+   `retiredDevices`: of two notes about the same device, the one about its later file is kept, or
+   of two about the same file the one that was made earlier, and a note about this device is left
+   out. Its `device` is not: it says what the retired device is.
+3. Add a note to `retiredDevices` that the device was retired, with when, which is the current time
+   or the latest `revisionDate` of the files that were read if that is later, and the
+   `revisionDate` of its file.
+4. Leave out what the device no longer has to hold, with the file of the retired device among the
+   files of the other devices, and write the file of the device as for a change of the vault, with
+   its `revisionDate` set the same way, and `version` set to `3`. A file without `retiredDevices`
+   is still written with `version` 2.
+
+A note says that a file of a device was taken over as long as the `revisionDate` of the file is the
+one that the note has, or earlier. A device writes each file with a change later than every one
+before it (see [Changing a vault](#changing-a-vault)), and a file from before the one that was taken
+over, such as the backup of its file, or a copy of its directory from a backup, holds nothing that
+the vault is not the same without: what the device left out of its file since was replaced, or
+deleted and the deletion forgotten. Every device leaves such a file out of the vault as soon as it
+has the note, in whichever file the note is (see
+[Putting the vault together](#putting-the-vault-together)), whatever its clock says: the vault is
+the same with it or without it.
+
+A later file of the device, which it writes should it be still used after all, still holds what
+the file that was taken over held. Every device that has a note about the device in a file that is
+not left out leaves that out of the vault: what such a file holds since the file that the latest of
+those notes is about, which are the versions whose stamp has an `in` of the `revisionDate` of that
+file or earlier, and, of those whose stamp has no `in`, as an earlier client wrote them, those that
+the device wrote (`by`) then or earlier (`at`). The device that took that file over holds them, or
+what replaced them. Otherwise the device would bring back, with its next change, the items whose
+deletions were forgotten since it was retired: it does not know that it was retired until the note
+comes to it, which can be after its directory was deleted, if it was not used for long. A note in a
+file that is left out does not count for that. The device that took that file over took the note
+over with it, but for one about itself: what the file that is left out took over from it is held by
+it alone then.
+
+For 90 days after the earliest such note, the time that it can take to come to every device:
+
+- Every device weighs its own file against the file that was taken over as well when it looks for
+  what it no longer has to hold: a device that does not have the note yet still puts the vault
+  together from it.
+- The device that was retired still writes its file from the one that was taken over, should it be
+  still used after all. The next time that it looks for what it no longer has to hold, at the
+  first sync of its client a day or more after it last did (see
+  [What a device no longer has to hold](#what-a-device-no-longer-has-to-hold)), it writes its file
+  again with a later `revisionDate`, even if it finds nothing to leave out, as it does when it
+  changes the vault: the note is then about a file before, and the device is not retired anymore.
+  A device that is still used is thus never retired for longer than a day or so.
+
+After that, the file no longer counts at all. The first device that looks for what it no longer
+has to hold deletes the directory of the device, but only if its `vault.json` is complete and is
+the file that the note is about, or an earlier one: a file that stands in for it can be older than
+a `vault.json` that has not fully come yet, which would be deleted with it. It deletes everything
+else in the directory first, then `vault.json`, then the directory: a deletion that stops before it
+is done then leaves `vault.json` in its place, and the directory is deleted the next time, where a
+file that stands in for it, left on its own, would keep the directory for good. A device that was
+retired and is used again after that starts a new file in its directory, as a device that never
+wrote one does, with a later `revisionDate` than the file that was taken over: what it held before
+is held by the device that retired it.
+
+A device that is still used, but syncs or changes the vault for the first time since it was retired
+after the other devices deleted its directory, before that deletion and the note come to it, writes
+its file from the one that was taken over, in a directory that the other devices deleted. A tool
+that syncs the folder can then keep the deletion of the directory, and the change is lost, or keep
+the file, which counts with what came into it since the file that was taken over: its change. Until
+the files of the other devices come to it, that file also holds the master password of its time
+again. A file of an earlier client does not say when its versions came into it, so what that device
+took over from another one before it was retired counts as well, and can bring back the items whose
+deletions were forgotten since, and what it wrote later with a clock that was behind is left out.
+
+Notes are kept for good, so that a copy of the directory of a device that comes back, such as one
+from a backup, is left out as well. A client that does not know version 3 has no vault to use or to
+change once a device of the account was retired, until it is updated (see
+[Putting the vault together](#putting-the-vault-together)): it would take `retiredDevices` for part
+of the record of the account, and put the vault together from the files that were retired, which
+brings back the items whose deletions are forgotten once they are left out.
 
 ## Deleting an account
 
@@ -503,3 +635,6 @@ another record, so it never brings an older master password back.
 Deleting an account deletes the files of every device, and leaves its `vault.json` to say that
 it was deleted, whatever a device that the deletion has not come to yet writes in the meantime
 (see [Deleting an account](#deleting-an-account)).
+
+A device that is gone for good is retired from one that is still used, which takes over what only
+it held, and its directory is deleted 90 days later (see [Retiring a device](#retiring-a-device)).

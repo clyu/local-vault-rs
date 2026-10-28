@@ -55,32 +55,6 @@ impl Devices {
     }
 }
 
-/// Does what a tool that syncs the vault folder does with the files that a device wrote: puts
-/// them in the copy of another device as they are, and deletes there what the device deleted.
-/// The other files of an account are written once, and only copied where they are missing.
-fn deliver(from: &MemoryFileSystem, device_id: &str, to: &MemoryFileSystem) {
-    let is_of_device = |path: &[String]| {
-        path.get(1).is_some_and(|name| name == "devices")
-            && path.get(2).is_some_and(|name| name == device_id)
-    };
-    for path in to.paths() {
-        let names = strs(&path);
-        if is_of_device(&path) && from.get(&names).is_none() {
-            block_on(to.delete(&names)).unwrap();
-        }
-    }
-    for path in from.paths() {
-        let names = strs(&path);
-        if is_of_device(&path) || to.get(&names).is_none() {
-            to.put(&names, from.get(&names).unwrap());
-        }
-    }
-}
-
-fn strs(path: &[String]) -> Vec<&str> {
-    path.iter().map(String::as_str).collect()
-}
-
 fn sync(client: &Client<MemoryFileSystem>, token: &str) -> Value {
     body(&client.get("sync", token))
 }
@@ -163,7 +137,7 @@ fn no_local_server_is_made_for_a_device_id_that_cannot_be_the_name_of_a_director
     for device_id in ["", "..", "a/b", "a.b", "a b", long.as_str()] {
         let fs = MemoryFileSystem::new();
         let platform = TestPlatform::at(NOON);
-        let server = LocalServer::new(fs, platform, ClientKind::Browser, device_id);
+        let server = LocalServer::new(fs, platform, ClientKind::Browser, device_id, "chrome", 2);
         assert!(server.is_err(), "{device_id}");
     }
 }

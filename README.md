@@ -23,7 +23,7 @@ both.
 | `crates/local-vault-wasm` | The module for JavaScript, through [wasm-bindgen](https://rustwasm.github.io/wasm-bindgen/). |
 | `crates/uniffi-bindgen` | Generates the Kotlin of `local-vault-uniffi`. |
 
-A client brings four things:
+A client brings five things:
 
 - **The file system of the vault folder**: list, exists, read, write, rename and delete, on paths
   that are lists of names relative to the folder. The operations are asynchronous, as the
@@ -39,6 +39,11 @@ A client brings four things:
   that a tool that syncs the folder never has two versions of a file to choose from, and the
   vault is put together from the files of every device. It is made of 1 to 128 ASCII letters,
   digits, `-` and `_`, as a UUID is: no local server is created for any other ID.
+- **The name and the type of its device**, as it names them to a Bitwarden server when it logs in
+  (`deviceName` and `deviceType`): the model of the phone and `0` for the Android app, and the
+  browser, such as `chrome`, and the type of the extension in it, such as `2`, for the extension.
+  The files of the device say them, so that the user can tell the devices that share the vault
+  folder apart.
 
 What a request asks for is worked out here, once for every client: the service it is for, the
 account of its token, its form and its query. The content of attachments is either streamed by
@@ -51,6 +56,13 @@ that the other folder does not have (`accounts_missing_in`), and of those that i
 of the device and the content of attachments that it does not have yet
 (`device_files_missing_in`). A client calls them, copies what they give in the order that they
 give it in, and does only the copying itself, as a stream.
+
+Which devices have a file in the vault of an account, and retiring one that is gone for good, which
+another device then takes the file of over and whose directory is deleted 90 days later, are
+requests of their own, which a Bitwarden server does not have: `GET local-vault/devices` and
+`POST local-vault/devices/{id}/retire`. A client makes them as any other request, and only shows
+what they answer: each device by its name and its type, if its file says them, and when it last
+changed the vault.
 
 The rules that a client checks itself against are here as well, so that its tests do not hold a
 copy of them:

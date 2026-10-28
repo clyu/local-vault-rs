@@ -102,6 +102,15 @@ impl Platform for TestPlatform {
     }
 }
 
+/// The name and the type that a client of the kind names its device by to a Bitwarden server: a
+/// phone, or the extension in Chrome.
+pub fn device_of(kind: ClientKind) -> (&'static str, i64) {
+    match kind {
+        ClientKind::Android => ("Pixel 8", 0),
+        ClientKind::Browser => ("chrome", 2),
+    }
+}
+
 /// Makes requests to a local server the way a client does.
 pub struct Client<F> {
     pub server: LocalServer<F, TestPlatform>,
@@ -122,7 +131,9 @@ impl<F: FileSystem> Client<F> {
     }
 
     pub fn on_device(fs: F, platform: TestPlatform, kind: ClientKind, device_id: &str) -> Self {
-        let server = LocalServer::new(fs, platform.clone(), kind, device_id).unwrap();
+        let (name, device_type) = device_of(kind);
+        let server = LocalServer::new(fs, platform.clone(), kind, device_id, name, device_type);
+        let server = server.unwrap();
         Self { server, platform }
     }
 
@@ -333,4 +344,45 @@ pub fn replace_vault_file(fs: &MemoryFileSystem, user_id: &str, vault: &Value) {
 pub fn path_of(url: &str) -> String {
     url.trim_start_matches("https://vault.local.invalid/")
         .to_owned()
+}
+
+/// Does what a tool that syncs the vault folder does with the files that a device wrote: puts
+/// them in the copy of another device as they are, and deletes there what the device deleted.
+/// The other files of an account are written once, and only copied where they are missing.
+pub fn deliver(from: &MemoryFileSystem, device_id: &str, to: &MemoryFileSystem) {
+    let is_of_device = |path: &[String]| {
+        path.get(1).is_some_and(|name| name == "devices")
+            && path.get(2).is_some_and(|name| name == device_id)
+    };
+    for path in to.paths() {
+        let names = strs(&path);
+        if is_of_device(&path) && from.get(&names).is_none() {
+            block_on(to.delete(&names)).unwrap();
+        }
+    }
+    for path in from.paths() {
+        let names = strs(&path);
+        if is_of_device(&path) || to.get(&names).is_none() {
+            to.put(&names, from.get(&names).unwrap());
+        }
+    }
+}
+
+/// Does what a tool that syncs the vault folder does with the directory of a device that was
+/// deleted in one copy of the folder, as that of a device that was retired: deletes it in the
+/// copy of another device.
+pub fn deliver_deletion(
+    from: &MemoryFileSystem,
+    user_id: &str,
+    device_id: &str,
+    to: &MemoryFileSystem,
+) {
+    let directory = [user_id, "devices", device_id];
+    if !block_on(from.exists(&directory)).unwrap() {
+        block_on(to.delete(&directory)).unwrap();
+    }
+}
+
+pub fn strs(path: &[String]) -> Vec<&str> {
+    path.iter().map(String::as_str).collect()
 }
