@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use futures::lock::Mutex;
 use serde_json::{Value, json};
 
-use crate::account::{profile, verify_password};
+use crate::account::{profile, user_key_rotation, verify_password};
 use crate::date::format_date;
 use crate::fs::{FileSystem, IoError};
 use crate::http::{
@@ -15,7 +15,7 @@ use crate::merge::DeviceDescription;
 use crate::organizations::profile_without_organizations;
 use crate::platform::{LogLevel, Platform, new_uuid};
 use crate::store::{KEY_REVISION_DATE, LocalVaultStore, ReadError, ReadVault, as_strs};
-use crate::token::user_id_of_access_token;
+use crate::token::bearer_of_access_token;
 use crate::vault::{ATTACHMENTS_PATH, get_attachment, get_cipher, get_folder, renew_attachment};
 
 /// The version of the Bitwarden server that the local server says it is.
@@ -195,6 +195,7 @@ enum AccountRoute<'a> {
     ChangePassword,
     UpdateKdf,
     RecordUserKeyId,
+    RotateUserAccountKeys,
     DeleteAccount,
     LocalVaultDevices,
     RetireLocalVaultDevice(&'a str),
@@ -324,6 +325,11 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
     /// Answers a request that is made as an account. Whether there is a route for it is looked
     /// at before whose it is: a request that there is no route for is refused as one, with or
     /// without the token of an account, and never as one that is not authorized.
+    ///
+    /// A token that was issued before the user key of the account was rotated is not authorized:
+    /// the client still has the key before, which the vault no longer has, and would encrypt with
+    /// it. Refused, it logs the account out, to be logged in to with the master password that
+    /// unlocks the new one (see `rotation`).
     async fn route_authenticated(
         &self,
         request: &LocalRequest,
@@ -336,17 +342,21 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
             self.platform.log(LogLevel::Warning, &message);
             return Ok(unsupported_response());
         };
-        let user_id = request
+        let bearer = request
             .access_token
             .as_deref()
-            .and_then(user_id_of_access_token);
-        let Some(user_id) = user_id else {
+            .and_then(bearer_of_access_token);
+        let Some(bearer) = bearer else {
             return Ok(unauthorized_response());
         };
-        let Some(vault) = self.read_vault(&user_id).await? else {
+        let Some(vault) = self.read_vault(&bearer.user_id).await? else {
             return Ok(unauthorized_response());
         };
-        self.run(route, &user_id, &vault, request, state).await
+        if bearer.user_key != user_key_rotation(&vault) {
+            return Ok(unauthorized_response());
+        }
+        self.run(route, &bearer.user_id, &vault, request, state)
+            .await
     }
 
     async fn run(
@@ -416,6 +426,9 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
             R::ChangePassword => self.change_password(user_id, vault, request).await,
             R::UpdateKdf => self.update_kdf(user_id, vault, request).await,
             R::RecordUserKeyId => self.record_user_key_id(user_id, vault, request).await,
+            R::RotateUserAccountKeys => {
+                self.rotate_user_account_keys(user_id, vault, request).await
+            }
             R::DeleteAccount => self.delete_account(user_id, vault, request).await,
             R::LocalVaultDevices => self.local_vault_devices(user_id).await,
             R::RetireLocalVaultDevice(device_id) => {
@@ -604,6 +617,9 @@ fn account_route<'a>(method: &str, path: &[&'a str]) -> Option<AccountRoute<'a>>
         ("POST", ["accounts", "password"]) => R::ChangePassword,
         ("POST", ["accounts", "kdf"]) => R::UpdateKdf,
         ("POST", ["accounts", "key-management", "user-key-id"]) => R::RecordUserKeyId,
+        ("POST", ["accounts", "key-management", "rotate-user-account-keys"]) => {
+            R::RotateUserAccountKeys
+        }
         ("DELETE", ["accounts"]) => R::DeleteAccount,
         ("GET", ["local-vault", "devices"]) => R::LocalVaultDevices,
         ("POST", ["local-vault", "devices", device_id, "retire"]) => {

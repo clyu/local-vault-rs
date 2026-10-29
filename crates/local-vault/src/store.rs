@@ -23,6 +23,14 @@ pub const LOCAL_VAULT_VERSION: i64 = 2;
 /// layout that it does not know, which it neither uses nor writes, only once a device was retired.
 pub(crate) const RETIRED_DEVICES_VERSION: i64 = 3;
 
+/// The version of the file of a device that holds a version that was written with a user key that
+/// replaced the one that the account was registered with (see [`merge::KeyRotation`]). A device
+/// writes it only then, so that a client that does not know of rotated keys takes the vault for one
+/// of a layout that it does not know, only once a key was rotated: it would take a version that was
+/// written later with a key that the vault no longer has for the newer one. A file of this version
+/// can say which devices its device retired as well.
+pub(crate) const USER_KEY_ROTATION_VERSION: i64 = 4;
+
 /// The version of the layout before this one, in which the `vault.json` of an account held the
 /// whole vault. The devices took such vaults over into their files, and they are no longer read.
 const SINGLE_FILE_VERSION: i64 = 1;
@@ -328,6 +336,11 @@ impl<F: FileSystem> LocalVaultStore<F> {
 
     pub(crate) fn file_system(&self) -> &F {
         &self.file_system
+    }
+
+    /// The ID of this device, which names the directory that it writes its files in.
+    pub(crate) fn device_id(&self) -> &str {
+        &self.device_id
     }
 
     /// Returns every account with the email, by its ID, with its vault without its folders and
@@ -878,7 +891,12 @@ impl<F: FileSystem> LocalVaultStore<F> {
             match self.read_content(&directory, &DEVICE_READ_ORDER).await? {
                 Content::Nothing => {}
                 Content::Vault {
-                    version: Some(LOCAL_VAULT_VERSION | RETIRED_DEVICES_VERSION),
+                    version:
+                        Some(
+                            LOCAL_VAULT_VERSION
+                            | RETIRED_DEVICES_VERSION
+                            | USER_KEY_ROTATION_VERSION,
+                        ),
                     content,
                     is_in_place,
                 } => {
@@ -1609,7 +1627,7 @@ mod tests {
         let other_email = vault("other@example.com", "other");
         save(&store, "account-b", &other_email, NOW);
         // A newer client wrote the file of another device.
-        let newer = json!({"format": "bitwarden-local-vault", "version": 4});
+        let newer = json!({"format": "bitwarden-local-vault", "version": 5});
         fs.put(&device_file(OTHER_DEVICE, VAULT_FILE), newer.to_string());
         let unknown_layout = ReadError::Unusable(ID.to_owned(), Unusable::UnknownLayout);
         let find = |email: &str| find_ids(&store, email);
@@ -1677,7 +1695,7 @@ mod tests {
         let unknown_layout = Err(ReadError::Unusable(ID.to_owned(), Unusable::UnknownLayout));
         let cases = [
             json!({"format": "something-else", "version": 2}),
-            json!({"format": "bitwarden-local-vault", "version": 4}),
+            json!({"format": "bitwarden-local-vault", "version": 5}),
             json!({"format": "bitwarden-local-vault"}),
             json!({"format": "bitwarden-local-vault", "version": "2"}),
             json!({"format": "bitwarden-local-vault-deleted"}),

@@ -170,7 +170,7 @@ fn a_vault_of_a_version_that_is_not_known_is_left_alone() {
     let folder = json!({"name": "2.folder"});
     client.send("POST", "folders", &token, folder);
     let mut newer = vault_file(&fs, &user_id);
-    newer["version"] = json!(4);
+    newer["version"] = json!(5);
     let content = newer.to_string();
     let file = device_file(&user_id, DEVICE);
     fs.put(&file, content.clone());

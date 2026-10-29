@@ -12,6 +12,7 @@ use crate::json::{
     JsonObject, int, int_or_null, into_object, is_blank, obj, string, string_or_null, with_fields,
 };
 use crate::kdf::{is_same_kdf, kdf_error};
+use crate::merge::KeyRotation;
 use crate::platform::{LogLevel, Platform};
 use crate::server::{ClientKind, LocalServer, Outcome};
 use crate::store::{KEY_ACCOUNT, KEY_SYNC, ReadVault};
@@ -19,6 +20,10 @@ use crate::verifier::{create_verifier, matches_verifier};
 
 /// The field of the account that holds what the master password is recognized by.
 pub(crate) const KEY_PASSWORD_VERIFIER: &str = "masterPasswordVerifier";
+
+/// The field of the account that holds the rotation that made its user key, which an account that
+/// has the key that it was registered with does not have (see [`KeyRotation`]).
+pub(crate) const KEY_USER_KEY_ROTATION: &str = "userKeyRotation";
 
 const INVALID_PASSWORD_MESSAGE: &str = "Invalid master password.";
 const FILES_LEFT_BEHIND_MESSAGE: &str =
@@ -213,6 +218,13 @@ pub(crate) fn is_password_hash(vault: &JsonObject, password_hash: Option<&str>) 
 pub(crate) fn password_verifier(vault: &JsonObject) -> Option<&JsonObject> {
     let account = obj(vault, KEY_ACCOUNT)?;
     obj(account, KEY_PASSWORD_VERIFIER)
+}
+
+/// The rotation that made the user key of the account, or `None` if it has the key that it was
+/// registered with.
+pub(crate) fn user_key_rotation(vault: &JsonObject) -> Option<KeyRotation> {
+    let account = obj(vault, KEY_ACCOUNT)?;
+    KeyRotation::read(account.get(KEY_USER_KEY_ROTATION)?)
 }
 
 /// The profile of the account that the vault belongs to.

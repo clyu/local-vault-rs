@@ -23,6 +23,12 @@
 //! it: it takes the file over into its own, and notes that it did (see [`take_over`]). The vault is
 //! then put together without that file (see [`left_out`]), and without what a later file of that
 //! device still holds from it (see [`Source::not_taken_over`]).
+//!
+//! The user key of an account can be replaced by a new one, with which every record is encrypted
+//! again (see [`KeyRotation`]). A device that does not have the new key yet still writes with the
+//! one before, so the stamp of a version also says which key the vault had when it was written,
+//! and a version that was written with a later key is newer than one that was written with an
+//! earlier one, whenever either was written.
 
 use std::borrow::Cow;
 use std::cmp::Ordering;
@@ -31,14 +37,14 @@ use std::collections::{BTreeMap, HashSet};
 use indexmap::IndexMap;
 use serde_json::{Value, json};
 
-use crate::account::KEY_PASSWORD_VERIFIER;
+use crate::account::{KEY_PASSWORD_VERIFIER, KEY_USER_KEY_ROTATION, user_key_rotation};
 use crate::date::parse_date_millis;
 use crate::json::{
     JsonObject, element, eq_ignore_case, int, is_safe_segment, obj, objects, string, with_fields,
 };
 use crate::store::{
     KEY_ACCOUNT, KEY_FORMAT, KEY_REVISION_DATE, KEY_SYNC, KEY_VERSION, LOCAL_VAULT_FORMAT,
-    LOCAL_VAULT_VERSION, RETIRED_DEVICES_VERSION,
+    LOCAL_VAULT_VERSION, RETIRED_DEVICES_VERSION, USER_KEY_ROTATION_VERSION,
 };
 
 /// The field of the file of a device with the stamps of the records that it holds, by their keys.
@@ -101,17 +107,24 @@ const MASTER_PASSWORD_KEY: &str = "masterPassword";
 
 /// The fields of a vault that are about the master password, by their paths: what it is
 /// recognized by, the user key encrypted with the master key, which also says how that is
-/// derived, its hint, and the security stamp that a change of it replaces. They are a record of
-/// their own, apart from the rest of the account, so that they are never taken from two versions,
-/// and so that a change of the rest of the account, which a device that does not have the newest
-/// master password yet can make, does not bring an older master password back.
-const MASTER_PASSWORD_FIELDS: [&[&str]; 5] = [
+/// derived, its hint, the security stamp that a change of it replaces, and the rotation that made
+/// the user key that it unlocks. They are a record of their own, apart from the rest of the
+/// account, so that they are never taken from two versions, and so that a change of the rest of
+/// the account, which a device that does not have the newest master password yet can make, does
+/// not bring an older master password back.
+const MASTER_PASSWORD_FIELDS: [&[&str]; 6] = [
     &[KEY_ACCOUNT, KEY_PASSWORD_VERIFIER],
+    &[KEY_ACCOUNT, KEY_USER_KEY_ROTATION],
     &[KEY_SYNC, "profile", "key"],
     &[KEY_SYNC, "profile", "masterPasswordHint"],
     &[KEY_SYNC, "profile", "securityStamp"],
     &[KEY_SYNC, "userDecryption", "masterPasswordUnlock"],
 ];
+
+/// The field of a stamp with the user key that the vault had when the version was written, as the
+/// rotation that made it (see [`KeyRotation`]). A stamp without it is that of a version that was
+/// written with the key that the account was registered with.
+const KEY_USER_KEY: &str = "key";
 
 /// How long a file can take to come to every device that shares the vault folder, as a device can
 /// be off for a while. A device holds a deletion that long once no other file has a version of
@@ -142,11 +155,54 @@ impl Scope {
     }
 }
 
-/// When a version was written, and by which device. Of two versions of a record, the one with the
+/// The rotation that made the user key of an account: when the key was made, and by which device.
+/// Every record of the vault is encrypted again with the new key, and a version that was written
+/// with it is newer than every one that was written with the key before (see [`Stamp`]). A
+/// rotation is later than the one that made the key that it replaces, even where the clock of its
+/// device is behind, so of two keys, the one of the later rotation is the newer one.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct KeyRotation {
+    /// When the key was made, in milliseconds since the epoch.
+    pub(crate) at: i64,
+    /// The ID of the device that made it.
+    pub(crate) by: String,
+}
+
+impl KeyRotation {
+    /// The rotation that the device makes now, of the key that the rotation `previous` made, or
+    /// of the key that the account was registered with.
+    pub(crate) fn next(previous: Option<&KeyRotation>, now_millis: i64, device_id: &str) -> Self {
+        let after_previous = previous.map(|previous| previous.at.saturating_add(1));
+        Self {
+            at: after_previous.map_or(now_millis, |at| at.max(now_millis)),
+            by: device_id.to_owned(),
+        }
+    }
+
+    /// Reads a rotation, which a file has as an object with `at` and `by`.
+    pub(crate) fn read(value: &Value) -> Option<Self> {
+        let rotation = value.as_object()?;
+        let at = int(rotation, "at")?;
+        let by = string(rotation, "by")?.to_owned();
+        Some(Self { at, by })
+    }
+
+    pub(crate) fn to_json(&self) -> Value {
+        json!({"at": self.at, "by": self.by})
+    }
+}
+
+/// When a version was written, and by which device, with which user key. Of two versions of a
+/// record, the one that was written with the later key is the newer one, whenever either was
+/// written: a device that does not have the newest key yet still writes with the one before,
+/// which the vault no longer has. Of two that were written with the same key, the one with the
 /// later stamp is the newer one, and the ID of the device decides between two that were written in
 /// the same millisecond.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct Stamp {
+    /// The rotation that made the user key that the vault had when the version was written, or
+    /// `None` for the key that the account was registered with.
+    pub(crate) key: Option<KeyRotation>,
     /// When the version was written, in milliseconds since the epoch.
     pub(crate) at: i64,
     /// The ID of the device that wrote it. A version that a device took over from a vault of the
@@ -155,21 +211,33 @@ pub(crate) struct Stamp {
 }
 
 impl Stamp {
-    /// The stamp of a version that the device writes now, in place of the version with the
-    /// stamp `previous`. It is later than that one even where the clock of the device is behind.
-    pub(crate) fn next(previous: Option<&Stamp>, now_millis: i64, device_id: &str) -> Self {
+    /// The stamp of a version that the device writes now with the user key that the rotation `key`
+    /// made, in place of the version with the stamp `previous`. It is later than that one even
+    /// where the clock of the device is behind.
+    pub(crate) fn next(
+        previous: Option<&Stamp>,
+        now_millis: i64,
+        device_id: &str,
+        key: Option<&KeyRotation>,
+    ) -> Self {
         let after_previous = previous.map(|previous| previous.at.saturating_add(1));
         Self {
+            key: key.cloned(),
             at: after_previous.map_or(now_millis, |at| at.max(now_millis)),
             by: device_id.to_owned(),
         }
     }
 
+    /// Reads a stamp. One whose key is not a rotation is not a stamp.
     fn read(value: &Value) -> Option<Self> {
         let stamp = value.as_object()?;
         let at = int(stamp, "at")?;
         let by = string(stamp, "by")?.to_owned();
-        Some(Self { at, by })
+        let key = match stamp.get(KEY_USER_KEY) {
+            None | Some(Value::Null) => None,
+            Some(key) => Some(KeyRotation::read(key)?),
+        };
+        Some(Self { key, at, by })
     }
 
     /// The stamp as the file of a device has it, with when the version came into the file, if
@@ -180,6 +248,9 @@ impl Stamp {
         stamp.insert("by".to_owned(), Value::from(self.by.as_str()));
         if let Some(came_in) = came_in {
             stamp.insert(KEY_CAME_IN.to_owned(), Value::from(came_in));
+        }
+        if let Some(key) = &self.key {
+            stamp.insert(KEY_USER_KEY.to_owned(), key.to_json());
         }
         Value::Object(stamp)
     }
@@ -382,6 +453,19 @@ impl Source {
             // that it does not know, which it neither uses nor writes. It would take the field for
             // part of the record of the account, and go on reading the files of the devices.
             file.insert(KEY_VERSION.to_owned(), Value::from(RETIRED_DEVICES_VERSION));
+        }
+        if self
+            .versions
+            .values()
+            .any(|version| version.stamp.key.is_some())
+        {
+            // The same goes for a client that does not know of rotated user keys, which would take
+            // a version that was written later with a key that the vault no longer has for the
+            // newer one. The version says that the client knows of retired devices as well.
+            file.insert(
+                KEY_VERSION.to_owned(),
+                Value::from(USER_KEY_ROTATION_VERSION),
+            );
         }
         file
     }
@@ -700,10 +784,12 @@ fn arrivals_of(file: &JsonObject, versions: &Versions) -> Arrivals {
 }
 
 /// The stamp of a folder or an item that the file of a device has no stamp for: when its revision
-/// date says, or else when the file was last written, by no device in particular.
+/// date says, or else when the file was last written, by no device in particular, with the user
+/// key that the account was registered with, as only an earlier client leaves a stamp out.
 fn unstamped(record: &JsonObject, file: &JsonObject) -> Stamp {
     let date = |object: &JsonObject| string(object, KEY_REVISION_DATE).and_then(parse_date_millis);
     Stamp {
+        key: None,
         at: date(record).or_else(|| date(file)).unwrap_or(0),
         by: String::new(),
     }
@@ -866,20 +952,21 @@ fn has_attachment(cipher: &JsonObject, attachment_id: &str) -> bool {
 
 /// The versions that a device writes for what changed from the vault that `base` makes up to the
 /// vault that is given: a new version of every record that is new or different, and a deletion
-/// of every record that is gone.
+/// of every record that is gone, each with the user key of the vault that is given.
 pub(crate) fn changes(
     base: &Versions,
     vault: &JsonObject,
     now_millis: i64,
     device_id: &str,
 ) -> Versions {
+    let key = user_key_rotation(vault);
+    let next = |previous| Stamp::next(previous, now_millis, device_id, key.as_ref());
     let records = records_of(vault, Scope::Vault);
     let kept: HashSet<String> = records.iter().map(|(key, _)| key.clone()).collect();
     let mut changes = Versions::default();
     for (key, version) in base {
         if version.record.is_some() && !kept.contains(key) {
-            let stamp = Stamp::next(Some(&version.stamp), now_millis, device_id);
-            changes.insert(key.clone(), Version::deletion(stamp));
+            changes.insert(key.clone(), Version::deletion(next(Some(&version.stamp))));
         }
     }
     for (key, record) in records {
@@ -888,8 +975,7 @@ pub(crate) fn changes(
             continue;
         }
         let previous_stamp = previous.map(|previous| &previous.stamp);
-        let stamp = Stamp::next(previous_stamp, now_millis, device_id);
-        changes.insert(key, Version::of(stamp, record));
+        changes.insert(key, Version::of(next(previous_stamp), record));
     }
     changes
 }
@@ -1101,6 +1187,7 @@ mod tests {
 
     fn stamp(at: i64, by: &str) -> Stamp {
         Stamp {
+            key: None,
             at,
             by: by.to_owned(),
         }
@@ -1177,10 +1264,16 @@ mod tests {
     fn a_version_is_stamped_later_than_the_one_that_it_replaces() {
         let previous = stamp(5_000, "b");
 
-        assert_eq!(Stamp::next(None, 1_000, "a"), stamp(1_000, "a"));
-        assert_eq!(Stamp::next(Some(&previous), 9_000, "a"), stamp(9_000, "a"));
+        assert_eq!(Stamp::next(None, 1_000, "a", None), stamp(1_000, "a"));
+        assert_eq!(
+            Stamp::next(Some(&previous), 9_000, "a", None),
+            stamp(9_000, "a")
+        );
         // The clock of the device is behind that of the one that wrote the previous version.
-        assert_eq!(Stamp::next(Some(&previous), 1_000, "a"), stamp(5_001, "a"));
+        assert_eq!(
+            Stamp::next(Some(&previous), 1_000, "a", None),
+            stamp(5_001, "a")
+        );
         assert!(stamp(5_000, "b") > stamp(5_000, "a"));
         assert!(stamp(5_001, "a") > stamp(5_000, "b"));
     }
@@ -1410,6 +1503,125 @@ mod tests {
         assert_eq!(changes.get("cipher:d"), Some(&deletion(101, "a")));
         assert_eq!(changes.get("cipher:c").unwrap().stamp, stamp(101, "a"));
         assert_eq!(changes.get("cipher:e").unwrap().stamp, stamp(50, "a"));
+    }
+
+    fn rotation(at: i64, by: &str) -> KeyRotation {
+        KeyRotation {
+            at,
+            by: by.to_owned(),
+        }
+    }
+
+    /// The stamp of a version that was written with the key that the rotation made.
+    fn keyed(key: &KeyRotation, at: i64, by: &str) -> Stamp {
+        Stamp {
+            key: Some(key.clone()),
+            ..stamp(at, by)
+        }
+    }
+
+    #[test]
+    fn a_version_that_was_written_with_a_later_key_is_newer_whenever_it_was_written() {
+        let earlier = rotation(10, "b");
+        let later = rotation(9, "c");
+        let rotated = Version::of(
+            keyed(&rotation(5, "a"), 5, "a"),
+            into_object(json!({"v": 1})),
+        );
+        // Written later, with the key before, by a device that did not have the rotation yet.
+        let a = versions(vec![
+            ("cipher:1", rotated.clone()),
+            ("cipher:2", deletion(1, "a")),
+        ]);
+        let b = versions(vec![
+            ("cipher:1", version(50, "b", json!({"v": 0}))),
+            (
+                "cipher:2",
+                Version::of(keyed(&earlier, 2, "b"), into_object(json!({"v": 2}))),
+            ),
+        ]);
+
+        let merged = merge([&a, &b]);
+
+        assert_eq!(merged.get("cipher:1"), Some(&rotated));
+        assert_eq!(
+            merged.get("cipher:2").unwrap().stamp,
+            keyed(&earlier, 2, "b")
+        );
+        assert!(keyed(&earlier, 1, "a") > stamp(i64::MAX, "z"));
+        assert!(keyed(&earlier, 1, "a") > keyed(&later, 100, "z"));
+        assert!(keyed(&earlier, 2, "a") > keyed(&earlier, 1, "z"));
+    }
+
+    #[test]
+    fn a_rotation_is_later_than_the_one_that_made_the_key_before() {
+        let previous = rotation(5_000, "b");
+
+        assert_eq!(KeyRotation::next(None, 1_000, "a"), rotation(1_000, "a"));
+        assert_eq!(
+            KeyRotation::next(Some(&previous), 9_000, "a"),
+            rotation(9_000, "a")
+        );
+        // The clock of the device is behind that of the one that made the key before.
+        assert_eq!(
+            KeyRotation::next(Some(&previous), 1_000, "a"),
+            rotation(5_001, "a")
+        );
+    }
+
+    #[test]
+    fn what_changed_is_stamped_with_the_key_of_the_vault() {
+        let base_vault = vault(json!([]), json!([{"id": "c"}, {"id": "d"}]));
+        let base = versions_of(&base_vault, 100, "b");
+        let mut changed = vault(json!([]), json!([{"id": "c", "v": 1}]));
+        let key = json!({"at": 90, "by": "a"});
+        changed.insert("account".to_owned(), json!({"userKeyRotation": key}));
+
+        let changes = changes(&base, &changed, 50, "a");
+
+        let key = rotation(90, "a");
+        assert_eq!(
+            changes.get("cipher:d"),
+            Some(&Version::deletion(keyed(&key, 101, "a")))
+        );
+        assert_eq!(
+            changes.get("cipher:c").unwrap().stamp,
+            keyed(&key, 101, "a")
+        );
+        let master_password = changes.get("masterPassword").unwrap();
+        assert_eq!(master_password.stamp, keyed(&key, 101, "a"));
+        let record = master_password.record.as_ref().unwrap();
+        assert_eq!(
+            record["account"]["userKeyRotation"],
+            json!({"at": 90, "by": "a"})
+        );
+    }
+
+    #[test]
+    fn a_file_with_a_version_of_a_rotated_key_is_written_as_version_4_and_read_back() {
+        let key = rotation(7, "b");
+        let written = versions(vec![
+            ("cipher:c", version(1, "a", json!({"id": "C"}))),
+            ("cipher:d", Version::deletion(keyed(&key, 2, "a"))),
+        ]);
+        let mut device = source("a", &written);
+        device
+            .retired_devices
+            .insert("d".to_owned(), retirement(4, NOON));
+
+        let file = device.to_file();
+
+        assert_eq!(file["version"], 4);
+        let stamp_of_d = json!({"at": 2, "by": "a", "key": {"at": 7, "by": "b"}});
+        assert_eq!(file["tombstones"]["cipher:d"], stamp_of_d);
+        assert_eq!(file["records"]["cipher:c"], json!({"at": 1, "by": "a"}));
+        let read = Source::device("a".to_owned(), &file, Scope::Vault);
+        assert_eq!(read.versions, written);
+        // A stamp whose key is not a rotation is not read.
+        let mut odd = file;
+        odd["records"]["cipher:c"]["key"] = json!("b");
+        let read = Source::device("a".to_owned(), &odd, Scope::Vault);
+        assert_eq!(read.versions.get("cipher:c").unwrap().stamp, stamp(0, ""));
     }
 
     #[test]

@@ -340,13 +340,14 @@ a newer one of the device that wrote it.
 | Tell the client how to derive the master key | The KDF settings are read from the vault of the account with that email address, which is the one with the lowest ID if there are several. An unknown address gets the defaults, unless the vault of an account is still on its way to the device, or has a layout that is not known, as the address may be its: the request then fails as one that did not reach the server. |
 | Check the master password | The client sends the same password hash it sends to a server. It is checked against a salted verifier in the vault, which is the counterpart of the hash a server stores. |
 | Find the account that logs in | The account directories are searched for the ones with that email address. They are gone through in the order of their IDs, and the first one that the master password is right for is logged in to. Nothing is registered per device, so a device that is given a vault folder can log in to the accounts in it. |
-| Issue tokens | An access token in the shape of the JWT that the identity server issues, carrying the account ID, and a refresh token. Neither is signed, and they are valid for years: they never leave the process, and what they give access to is encrypted with keys they do not hold. |
+| Issue tokens | An access token in the shape of the JWT that the identity server issues, carrying the account ID, and a refresh token. Neither is signed, and they are valid for years: they never leave the process, and what they give access to is encrypted with keys they do not hold. Both say which user key the account had when they were issued, and are refused once it was rotated (below). |
 | Return the vault | The `sync` part of the vault, put together from the files of every device, is the body of the response to `GET /sync`, without what it says about organizations (below). |
 | Tell the client which organizations the account is in | None: an account is never in an organization, and has no provider. Whoever can write to the vault folder can still put an organization in a file, with its key encrypted with the public key of the account, which the folder holds. A client that is told about it would take its key in, decrypt its items, offer to put new items in it, apply its policies, and send the key of the account to its Key Connector. So every response that has the vault, the profile or an item has them as an account that was never in an organization does: no organizations, providers, collections or policies, no Key Connector, no master password that an administrator reset, and every item in no organization, which a client cannot decrypt if it was encrypted with the key of one. A field is replaced in whatever case its key is written in, as a client may read it by another case than the server writes it in. The files are left as they are. |
 | Store a change | The vault is read and changed as a whole, and what changed is written to the file of the device. |
 | Refuse to overwrite a newer item | An item is only replaced if the revision date that the client knows it by is the one in the vault, within a second. |
 | Refuse an item of another account | A request that stores an item says in `encryptedFor` which account the client encrypted it for. If that is not the account of the token, the request is refused, as the item could not be decrypted in the vault that it would be stored in. One such item refuses a whole import. |
 | Refuse an item of another key | A client can have the ID of the user key recorded in the vault, which the SDK of the browser extension does. An item that says in `encryptedByKeyId` that it was encrypted with another key is then refused, as it is from a client that has another user key than the vault. |
+| Rotate the user key | The client makes a new user key, and encrypts with it again the private key of the account and every item and folder, and the vault takes them all at once, along with a new master password that unlocks the new key (`POST accounts/key-management/rotate-user-account-keys`). A rotation that leaves out an item or a folder of the vault, or has one that the vault does not have, is refused, as is one in which an item changed since the client received it, or that leaves out the key of an attachment of an item, or with which the master key would be derived from another salt or with other KDF settings, or the key pair of the account would change. So is one that comes with the keys of encryption version 2, and one of a vault that has no public key of the account to tell the key pair by. A folder is not checked for a change: the client does not say which version of it it encrypted again, so a name that another device gave it in the meantime is replaced. The account gets a new security stamp, and the ID of its user key is no longer recorded. The vault records which rotation made the key, and every version that a device writes says with which key it was written (see [Sharing a vault between devices and clients](#sharing-a-vault-between-devices-and-clients)). The tokens from before the rotation are refused, which logs a client out that still has the key before. |
 | Import into a folder that exists | A folder that an import comes with is the folder of the vault with that ID, if there is one. Only a folder without an ID, or with one that the vault does not have, is added, under a new ID. |
 | Store attachments | The client is given an upload URL on the reserved host, as it would be given one for cloud storage. The local server answers that URL as well. Downloads work the same way. |
 | Delete an attachment or an item | The vault is saved without it, and the attachments that it took out are noted in the file of the device. Their content is deleted 90 days later, when the device tidies its file, unless a change of another device brought them back in the meantime. Content that cannot be deleted then is deleted the next time. Until then it is not handed out. |
@@ -389,7 +390,7 @@ register, and registering the address again must be avoided: on a device that th
 not arrived on yet, it makes a second account with the same address instead of opening the
 first (see [Limits to keep in mind](#limits-to-keep-in-mind)).
 
-Four mechanisms make this work, and the local vault implements them for every client.
+Five mechanisms make this work, and the local vault implements them for every client.
 
 **Noticing a change from outside.** Before a sync, a client asks when the vault last changed and
 skips the sync if that is before its last sync. A file that a sync tool brought in can carry a
@@ -419,6 +420,22 @@ password only with the settings of the account, but cannot tell whether the user
 with a master key that they derive: an account whose user key is encrypted with another one can
 never be unlocked again.
 
+**Rotating the user key.** A rotation replaces the user key, the master password, and everything
+that the key encrypted, at once. A device that does not have the rotation yet still has the key
+before, and writes with it: so every version in the files says with which key it was written, and
+one that was written with a later key is newer than one that was written with an earlier one,
+whenever either was written. What such a device writes in the meantime never replaces what the
+rotation wrote: its change of an item is lost, and a change of the account does not bring back the
+private key encrypted with the key before. An item that it adds stays, but cannot be decrypted
+with the new key. Once the rotation has come to the device, the tokens that it issued before are
+refused, and the client logs the account out before it writes again, as it does when a refresh
+token is refused. It does not keep what unlocks the key before either, such as the user key
+encrypted with a PIN. Logged in again with the new master password, it has the new key. Of two
+rotations on two devices before either has the other one, the later one is kept, with everything
+that was written with its key. A client that does not know of rotated keys cannot use the account
+once its key was rotated, as the files with versions of the new key are of a layout that it does
+not know.
+
 **Changing the KDF settings.** The change replaces the verifier and the encrypted user key as
 well, with those of the master key that the new settings derive, but keeps the user key and the
 security stamp, so no client is logged out. Every other client takes the new settings at its next
@@ -440,6 +457,7 @@ the settings. Logging in is not affected, as a client asks how to derive the mas
 | Attachments | Logging in with a device or with admin approval |
 | Importing from another password manager | Buying or managing a subscription |
 | Changing the master password and the KDF settings | Policies |
+| Rotating the user key, from the browser extension | |
 | Master password hint | Real-time sync by push notification |
 | Several accounts in one vault folder | |
 
@@ -489,6 +507,9 @@ file system and the setting for the vault folder. A workable order:
    that derives the new master key with the settings that it was unlocked with then leaves an
    account that can never be unlocked again (see
    [Sharing a vault between devices and clients](#sharing-a-vault-between-devices-and-clients)).
+   Rotate the user key on one client, and check that the other one logs the account out once the
+   rotation has come to it, and decrypts every item once it is logged in to with the new master
+   password.
 
 ## Limits to keep in mind
 
@@ -522,15 +543,30 @@ file system and the setting for the vault folder. A workable order:
 - **A client that is not updated cannot use an account once a device of it was retired.** The
   file of the device that retired it has a layout that such a client does not know, which it
   neither uses nor writes until it is updated.
-- **Changing the master password does not lock out whoever knows the old one.** Nothing changes
-  the user key, and the user key encrypted with the old master key stays in the folder: a device
-  leaves the older master password out of its file only the next time that it syncs or
+- **Changing the master password alone does not lock out whoever knows the old one.** It does not
+  change the user key, and the user key encrypted with the old master key stays in the folder: a
+  device leaves the older master password out of its file only the next time that it syncs or
   changes the vault, the backup of the file keeps it until the file is written again, and the
   directory of a device that is gone for good, such as that of a browser extension that was
   installed again, keeps it until 90 days after the device is retired. Whoever has the old master
   password and a copy of the folder can therefore decrypt the vault, items added after the change
-  included. If the master password may be known to someone else, export the vault, import it into
-  a new account, and delete the old account, which deletes the files of every device.
+  included. If the master password may be known to someone else, rotate the user key along with
+  it. What the vault held before the rotation stays readable with the old master password in such
+  a copy, and so does what the files of the devices still hold of it: older versions of the
+  records, for 90 days, as with any change.
+- **A rotation of the user key does not reach what a device writes before it gets the rotation.**
+  A device that does not have it yet writes with the key before. Its changes of items that the
+  rotation encrypted again are lost, and an item that it adds cannot be decrypted with the new key,
+  but can be with an earlier master password. So can an item whose file had not come to the
+  device that rotated the key, which the rotation could not encrypt again. Let the devices that
+  share the folder sync before a rotation, and do not change the vault on another device until the
+  rotation has come to it. A folder that another device renamed after the device that rotates the
+  key last synced gets its name from before back, as the rotation is not checked for a change of
+  a folder, as it is for one of an item. An item that cannot be decrypted keeps the user key from
+  being rotated again until it is deleted.
+- **A client that is not updated cannot use an account once its user key was rotated.** The files
+  that hold versions of the new key have a layout that such a client does not know, which it
+  neither uses nor writes until it is updated.
 - **Stronger KDF settings do not protect what the folder held before.** The user key encrypted
   with the master key of the settings from before stays in the folder in the same places as after
   a change of the master password, and is in every copy of the folder from before the change: the

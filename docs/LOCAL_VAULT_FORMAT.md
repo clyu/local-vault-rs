@@ -130,7 +130,7 @@ it takes it for a layout that it does not know, which it does not use or write.
 | Field | Meaning |
 |-------|---------|
 | `format` | Always `bitwarden-local-vault`. A file with another value is not a vault. |
-| `version` | The version of this layout, `2`, or `3` for the file of a device that retired another one: see [Retiring a device](#retiring-a-device). A file with a version that a client does not know must be left alone. |
+| `version` | The version of this layout, `2`, `3` for the file of a device that retired another one (see [Retiring a device](#retiring-a-device)), or `4` for one that holds a version that was written with a user key that was rotated (see [Rotating the user key](#rotating-the-user-key)). A file with a version that a client does not know must be left alone. |
 | `revisionDate` | When the device last changed the vault, as an ISO-8601 date in UTC. |
 | `since` | Earlier clients wrote when the device first wrote the file. Nothing reads it, and it is left out when the file is written again. |
 | `account` | What a server keeps to itself about the account. |
@@ -147,10 +147,11 @@ The vault is made of records: the record of the master password, the record of t
 folder and every item.
 
 The record of the master password is these fields, at their places in the file:
-`account.masterPasswordVerifier`, `sync.profile.key`, `sync.profile.masterPasswordHint`,
-`sync.profile.securityStamp` and `sync.userDecryption.masterPasswordUnlock`. It is changed as a
-whole: the verifier, the user key encrypted with the master key, the parameters that the master
-key is derived with and the security stamp are never taken from two different versions. The
+`account.masterPasswordVerifier`, `account.userKeyRotation`, `sync.profile.key`,
+`sync.profile.masterPasswordHint`, `sync.profile.securityStamp` and
+`sync.userDecryption.masterPasswordUnlock`. It is changed as a whole: the verifier, the user key
+encrypted with the master key, the rotation that made that user key, the parameters that the
+master key is derived with and the security stamp are never taken from two different versions. The
 record of the account is everything else in the file but `sync.folders`, `sync.ciphers` and the
 fields that are about the file (`format`, `version`, `revisionDate`, `since`, `records`,
 `tombstones`, `removedAttachments`, `retiredDevices` and `device`). The two are records of their
@@ -171,6 +172,13 @@ device (`by`). Of two versions of a record, the one with the later `at` is the n
 two with the same `at`, the one whose `by` comes later, compared as strings by their UTF-16 code
 units. A folder or an item in `sync` that `records` has no stamp for is taken to have been written
 at its `revisionDate`, or else at the `revisionDate` of the file, by no device (`""`).
+
+A stamp also says with which user key the version was written, once the key of the account was
+rotated (`key`), and that comes first: of two versions of a record, the one that was written with
+the later key is the newer one, whatever their `at` (see
+[Rotating the user key](#rotating-the-user-key)). A stamp without `key`, or with `key` set to
+`null`, is that of a version that was written with the key that the account was registered with. A
+stamp whose `key` is anything else is not a stamp.
 
 A stamp in the file of a device also says when the version came into that file (`in`): the
 `revisionDate` that the file had when the device first wrote it with the version, in milliseconds
@@ -271,7 +279,8 @@ The vault of an account is put together from all of its files, the same way on e
    file that is not left out is about, and that is not left out itself, leave out the versions that
    it holds since the file that the latest such note is about: the device that took that file over
    holds them, or what replaced them.
-5. Take the newest version of each record, and of versions that are as new, the first one that
+5. Take the newest version of each record (see [Records and stamps](#records-and-stamps)), and of
+   versions that are as new, the first one that
    was read. A record whose newest version is a deletion is not in the vault.
 6. The vault is the record of the account, with the fields of the record of the master password
    in their places, the folders in `sync.folders` and the items in `sync.ciphers` in the order
@@ -314,7 +323,8 @@ A client that changes a vault writes the file of its own device, and no other:
    and after it, and give each a new version: the record, or a deletion for one that is gone.
    Its stamp has the ID of the device, and the current time or one millisecond after the stamp
    of the version that it replaces, whichever is later. A change that is made after another one
-   is thus newer than that one, even where the clock of its device is behind.
+   is thus newer than that one, even where the clock of its device is behind. Its `key` is the
+   `account.userKeyRotation` of the vault after the change, if it has one.
 3. Read the files of the devices again, as the file of another device may have come in since.
    The new file of the device is the versions that it holds, with the new ones in place of those
    of the same records, without what it no longer has to hold (see below), and with
@@ -554,6 +564,74 @@ change once a device of the account was retired, until it is updated (see
 of the record of the account, and put the vault together from the files that were retired, which
 brings back the items whose deletions are forgotten once they are left out.
 
+## Rotating the user key
+
+Changing the master password does not change the user key, which every copy of the vault folder
+from before the change still has encrypted with the master key of the old master password. Whoever
+knows that password, and has such a copy, can decrypt the vault, what is added to it later
+included. Rotating the user key replaces it with a new one, along with the master password: the
+client makes the key, and encrypts with it again everything that the key before encrypted, which
+is the private key of the account, every item and every folder. Whoever knows an earlier master
+password can still decrypt what the vault held before, but nothing that is written with the new
+key.
+
+A client that rotates the user key makes one change of the vault (see
+[Changing a vault](#changing-a-vault)), which has:
+
+- A new version of the record of the master password: the new user key encrypted with the master
+  key of the new master password in `profile.key` and `userDecryption.masterPasswordUnlock`, the
+  verifier of the new master password, its hint, a new `securityStamp`, and the rotation in
+  `account.userKeyRotation`: when and by which device the key was made, as
+  `{"at": 1791720000000, "by": "<device id>"}`. `at` is the current time, or one millisecond after
+  the `at` of the `userKeyRotation` that the vault had, whichever is later. The salt and the KDF
+  parameters stay the same. An account that has the key that it was registered with has no
+  `userKeyRotation`.
+- A new version of the record of the account: the private key encrypted with the new user key in
+  `profile.privateKey` and in `profile.accountKeys.publicKeyEncryptionKeyPair.wrappedPrivateKey`,
+  without `userDecryption.userKeyId`, which is the ID of the key before. The key pair stays the
+  same, as `profile.accountKeys.publicKeyEncryptionKeyPair.publicKey` says, without which the
+  rotation is not made.
+- A new version of every folder and every item of the vault, encrypted with the new key, with a new
+  `revisionDate`. A rotation that does not have every one of them is not made: one that it left out
+  would stay encrypted with a key that the vault no longer has. Nor is one in which an item changed
+  since the client read it, or that leaves out the `key` of an attachment that has one: encrypted
+  with the new key, or as it was if the key of the item encrypts it. A folder is taken as the client
+  sends it, which does not say which version of it the client read: a name that another device gave
+  it in the meantime is replaced.
+
+The stamp of every version of the change, and of every version that is written with the new key
+after it, has the rotation in `key`, as every version that a device writes has the
+`userKeyRotation` of the vault that it changes (see [Records and stamps](#records-and-stamps)). Of
+two rotations, the one with the later `at` is the later one, and of two with the same `at`, the one
+whose `by` comes later, compared as strings by their UTF-16 code units. A version that was written
+with the key of a later rotation is newer than one that was written with that of an earlier one,
+or with the key that the account was registered with, whenever either was written: a device that
+does not have the rotation yet still has the key before, and writes with it. Its change of an item
+that the rotation encrypted again is lost, and a change of the account does not bring back the
+private key encrypted with the key before, nor a change of the master password the master password
+before. A record that only such a device wrote, such as an item that it added, is still in the
+vault, encrypted with a key that the vault no longer has. Of two rotations that two devices made
+before either had the other one, the later one is kept, with every version that was written with
+its key, and the items that the other device added with its own key are encrypted with a key that
+the vault does not have. The older versions of the record of the master password are left out of
+the files right away, as those of any change of the master password (see
+[What a device no longer has to hold](#what-a-device-no-longer-has-to-hold)).
+
+A client that has the rotation must not write anything with the key before. As the new
+`securityStamp` says, it logs the account out, and is logged in to again with the new master
+password, which unlocks the new key. It does not keep what unlocks the key before either, such as
+the user key encrypted with a PIN, which would unlock the account to that key again. The local vault
+refuses the tokens that it issued before the rotation as soon as the rotation has come to the
+device, which logs the client out before it can write with the key before.
+
+A file that holds a version whose stamp has `key` is written with `version` set to `4`, and may
+have `retiredDevices` as well. A file without such a version is still written with `version` 2,
+or 3. A client that does not know version 4 has no vault to use or to change once the user key of
+the account was rotated, until it is updated (see
+[Putting the vault together](#putting-the-vault-together)): it would take a version that a device
+that did not have the rotation yet wrote later for the newer one, and with it an item, or the
+private key, encrypted with a key that the vault no longer has.
+
 ## Deleting an account
 
 A client that deletes an account first replaces its `vault.json` with the one that says that the
@@ -638,7 +716,10 @@ record of the master password as well: of two changes of the master password at 
 kept, and the device whose change was not kept logs the account out when it sees the security
 stamp of the other one. The user key stays the same, so every item can still be decrypted. A
 change of the rest of the account, such as recording the ID of the user key, is a change of
-another record, so it never brings an older master password back.
+another record, so it never brings an older master password back. A rotation of the user key is
+the exception: what a device writes with the key before, once another device rotated it, never
+replaces what was written with the new key, and an item that it adds with it cannot be decrypted
+(see [Rotating the user key](#rotating-the-user-key)).
 
 Deleting an account deletes the files of every device, and leaves its `vault.json` to say that
 it was deleted, whatever a device that the deletion has not come to yet writes in the meantime

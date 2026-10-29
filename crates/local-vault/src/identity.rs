@@ -4,6 +4,7 @@ use serde_json::{Value, json};
 
 use crate::account::{
     master_password_unlock, password_verifier, profile, to_master_password_unlock,
+    user_key_rotation,
 };
 use crate::fs::FileSystem;
 use crate::http::{
@@ -18,7 +19,7 @@ use crate::platform::Platform;
 use crate::server::{LocalServer, Outcome};
 use crate::store::{LOCAL_VAULT_FORMAT, LOCAL_VAULT_VERSION, ReadVault};
 use crate::token::{
-    AccessTokenClaims, create_access_token, create_refresh_token, user_id_of_refresh_token,
+    AccessTokenClaims, bearer_of_refresh_token, create_access_token, create_refresh_token,
 };
 use crate::verifier::{create_verifier, matches_verifier};
 
@@ -246,37 +247,47 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
                 "object": "userDecryptionOptions",
             },
         });
-        let mut body = self.tokens(&user_id, &profile, request);
+        let mut body = self.tokens(&user_id, &vault, request);
         body.extend(into_object(login));
         Ok(ok_response(&Value::Object(body)))
     }
 
+    /// Renews the tokens of an account, unless its user key was rotated since they were issued:
+    /// the client still has the key before, and the refusal logs it out, to be logged in to with
+    /// the master password that unlocks the new one.
     async fn refresh_token_grant(&self, request: &LocalRequest) -> Outcome {
         let refresh_token = request.form_field("refresh_token").unwrap_or_default();
-        let Some(user_id) = user_id_of_refresh_token(refresh_token) else {
+        let Some(bearer) = bearer_of_refresh_token(refresh_token) else {
             return Ok(unknown_refresh_token());
         };
-        let Some(vault) = self.read_account(user_id).await? else {
+        let Some(vault) = self.read_account(&bearer.user_id).await? else {
             return Ok(unknown_refresh_token());
         };
-        let tokens = self.tokens(user_id, &profile(&vault), request);
+        if bearer.user_key != user_key_rotation(&vault) {
+            return Ok(unknown_refresh_token());
+        }
+        let tokens = self.tokens(&bearer.user_id, &vault, request);
         Ok(ok_response(&Value::Object(tokens)))
     }
 
-    fn tokens(&self, user_id: &str, profile: &JsonObject, request: &LocalRequest) -> JsonObject {
+    /// The tokens of the account of the vault, for the user key that it has.
+    fn tokens(&self, user_id: &str, vault: &JsonObject, request: &LocalRequest) -> JsonObject {
         let now_seconds = self.platform.now_millis().div_euclid(1000);
+        let profile = profile(vault);
+        let user_key = user_key_rotation(vault);
         let claims = AccessTokenClaims {
             user_id,
-            email: string(profile, "email").unwrap_or_default(),
-            name: string(profile, "name"),
+            email: string(&profile, "email").unwrap_or_default(),
+            name: string(&profile, "name"),
             // The client reads this back to ask for the next token.
             client_id: request.form_field("client_id"),
             expires_at_epoch_seconds: now_seconds + TOKEN_LIFETIME_SECONDS,
+            user_key: user_key.as_ref(),
         };
         let tokens = json!({
             "access_token": create_access_token(&claims),
             "expires_in": TOKEN_LIFETIME_SECONDS,
-            "refresh_token": create_refresh_token(user_id),
+            "refresh_token": create_refresh_token(user_id, user_key.as_ref()),
             "token_type": "Bearer",
         });
         into_object(tokens)

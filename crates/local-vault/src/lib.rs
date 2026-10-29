@@ -30,6 +30,7 @@ mod memory_fs;
 mod merge;
 mod organizations;
 mod platform;
+mod rotation;
 mod server;
 mod store;
 mod token;

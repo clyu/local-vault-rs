@@ -55,6 +55,10 @@ const ENCRYPTED_FOR_ANOTHER_MESSAGE: &str =
 const ENCRYPTED_BY_ANOTHER_KEY_MESSAGE: &str =
     "The item was not encrypted with the user key of this account. Sync your vault and try again.";
 const INVALID_PASSWORD_MESSAGE: &str = "Invalid master password.";
+const NOT_ALL_ROTATED_MESSAGE: &str =
+    "Some items or folders were not encrypted with the new key. Sync your vault and try again.";
+const ATTACHMENT_KEY_LEFT_OUT_MESSAGE: &str =
+    "The keys of some attachments were left out of the rotation of the user key.";
 
 impl<F: FileSystem, P: Platform> LocalServer<F, P> {
     /// Returns the whole vault, without what it says about organizations, and remembers what the
@@ -777,13 +781,96 @@ fn attachments_of(body: &JsonObject, existing: Option<&JsonObject>) -> Value {
     array_or_null(changed)
 }
 
+/// Returns the vault with every item and folder replaced by the one that the rotation of the user
+/// key comes with (`accountData`), which the client encrypted again with the new key, or the
+/// response that refuses them.
+///
+/// The rotation has to come with each of them, and with no other: one that it leaves out would
+/// stay encrypted with the key before, which the vault no longer has, and one that the vault does
+/// not have is not known here, as when another device deleted it. An item may not have changed
+/// since the client last received it, as for an update, has to be encrypted for the account, and
+/// has to come with the key of each of its attachments that has one. A folder is taken as it
+/// comes: the rotation does not say which version of it the client encrypted again, so a name that
+/// another device gave it since is replaced. The rotation does not say which key an item was
+/// encrypted with by the ID of the key that the vault has: it says that of the new key.
+pub(crate) fn with_rotated_items(
+    vault: &JsonObject,
+    data: &JsonObject,
+    user_id: &str,
+    now: &str,
+) -> Result<JsonObject, LocalResponse> {
+    let not_all_rotated = || bad_request(NOT_ALL_ROTATED_MESSAGE);
+    let ciphers = rotated(vault, data, CIPHERS).ok_or_else(not_all_rotated)?;
+    let folders = rotated(vault, data, FOLDERS).ok_or_else(not_all_rotated)?;
+    let mut rotated_ciphers = Vec::new();
+    for (existing, cipher) in &ciphers {
+        if is_encrypted_for_another(cipher, user_id) {
+            return Err(bad_request(ENCRYPTED_FOR_ANOTHER_MESSAGE));
+        }
+        if is_out_of_date(existing, string(cipher, "lastKnownRevisionDate")) {
+            return Err(bad_request(OUT_OF_DATE_MESSAGE));
+        }
+        if !has_every_attachment_key(existing, cipher) {
+            return Err(bad_request(ATTACHMENT_KEY_LEFT_OUT_MESSAGE));
+        }
+        let id = id_of(existing, "");
+        rotated_ciphers.push(to_cipher(cipher, &id, Some(existing), now));
+    }
+    let rotated_folders = folders
+        .iter()
+        .map(|(existing, folder)| folder_json(&id_of(existing, ""), element(folder, "name"), now));
+    let updated = with_items(vault, CIPHERS, rotated_ciphers);
+    Ok(with_items(&updated, FOLDERS, rotated_folders.collect()))
+}
+
+/// Returns `true` if the item of a rotation has the key of every attachment of the item of the
+/// vault that has a key (`attachments2`, by the ID of the attachment). A client sends each of
+/// them, encrypted again with the new user key, or as it was if it is encrypted with the key of
+/// the item: one that is left out would stay as it was, and its content could not be decrypted
+/// once it was encrypted with the user key before. The content of an attachment without a key is
+/// encrypted with the user key itself, which a rotation cannot encrypt again: the clients of
+/// upstream do not rotate the key while an item has one (`hasOldAttachments`).
+fn has_every_attachment_key(existing: &JsonObject, rotated: &JsonObject) -> bool {
+    let rotated_keys = obj(rotated, "attachments2");
+    objects(existing, "attachments")
+        .iter()
+        .filter(|attachment| string(attachment, "key").is_some())
+        .all(|attachment| {
+            let rotated_attachment = string(attachment, "id")
+                .zip(rotated_keys)
+                .and_then(|(id, keys)| obj(keys, id));
+            rotated_attachment.is_some_and(|rotated| string(rotated, "key").is_some())
+        })
+}
+
+/// Pairs each item or folder of the vault with the one of the rotation that has its ID, in
+/// whatever case, or returns `None` unless the rotation has each of them once, and no other.
+fn rotated(
+    vault: &JsonObject,
+    data: &JsonObject,
+    key: &str,
+) -> Option<Vec<(JsonObject, JsonObject)>> {
+    let requested = objects(data, key);
+    let existing = items(vault, key);
+    // The vault has each ID once, so a rotation with as many of them that has every one of them
+    // has no other, nor one twice.
+    if requested.len() != existing.len() {
+        return None;
+    }
+    let pair = |existing: JsonObject| {
+        let id = string(&existing, "id")?.to_owned();
+        let rotated = requested.iter().find(|rotated| has_id(rotated, &id))?;
+        Some((existing, rotated.clone()))
+    };
+    existing.into_iter().map(pair).collect()
+}
+
 /// Returns the response that refuses the item of a request, or `None` if the item can be
 /// stored. It has to be encrypted for the account that made the request, and with the user key
 /// of that account: a client counts on the server to refuse an item that is not, which could not
 /// be decrypted in this vault, and as an update would replace an item that can.
 fn refusal(body: &JsonObject, user_id: &str, vault: &JsonObject) -> Option<LocalResponse> {
-    let encrypted_for = string(body, "encryptedFor");
-    if encrypted_for.is_some_and(|id| !eq_ignore_case(id, user_id)) {
+    if is_encrypted_for_another(body, user_id) {
         return Some(bad_request(ENCRYPTED_FOR_ANOTHER_MESSAGE));
     }
     // A request says which key an item was encrypted with by the ID of that key, and the vault
@@ -796,6 +883,13 @@ fn refusal(body: &JsonObject, user_id: &str, vault: &JsonObject) -> Option<Local
         return Some(bad_request(ENCRYPTED_BY_ANOTHER_KEY_MESSAGE));
     }
     None
+}
+
+/// Returns `true` if the item of a request says that it was encrypted for another account than
+/// the one that made the request.
+fn is_encrypted_for_another(body: &JsonObject, user_id: &str) -> bool {
+    let encrypted_for = string(body, "encryptedFor");
+    encrypted_for.is_some_and(|id| !eq_ignore_case(id, user_id))
 }
 
 fn is_out_of_date(cipher: &JsonObject, last_known_revision_date: Option<&str>) -> bool {
