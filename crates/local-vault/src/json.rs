@@ -151,6 +151,25 @@ pub(crate) fn with_fields<const N: usize>(
     copy
 }
 
+/// Returns a copy of the object with the fields that it has set to the values. A field is also
+/// had by a key that differs from its key only in case, as a client may read a field by such a
+/// key: every such key is left out, and the value is set under the key of the field. A field that
+/// the object does not have is not added.
+pub(crate) fn with_fields_replaced<const N: usize>(
+    object: &JsonObject,
+    fields: [(&str, Value); N],
+) -> JsonObject {
+    let mut copy = object.clone();
+    for (key, value) in fields {
+        if !copy.keys().any(|name| eq_ignore_case(name, key)) {
+            continue;
+        }
+        copy.retain(|name, _| name == key || !eq_ignore_case(name, key));
+        copy.insert(key.to_owned(), value);
+    }
+    copy
+}
+
 /// Returns a copy of the object without the fields, the others in the order they were in.
 pub(crate) fn without_fields(object: &JsonObject, keys: &[&str]) -> JsonObject {
     let mut copy = object.clone();
@@ -304,6 +323,19 @@ mod tests {
 
         let expected = r#"{"b":4,"c":3,"d":5}"#;
         assert_eq!(Value::Object(changed).to_string(), expected);
+    }
+
+    #[test]
+    fn fields_are_replaced_in_whatever_case_and_only_if_they_are_there() {
+        let value = object(json!({"Key": 1, "a": 2, "key": 3, "KEY": 4, "Other": 5}));
+
+        let replaced = with_fields_replaced(&value, [("key", json!(0)), ("other", json!(0))]);
+        let untouched = with_fields_replaced(&value, [("missing", json!(0))]);
+
+        // The field keeps its place if it was there in its own case.
+        let expected = r#"{"a":2,"key":0,"other":0}"#;
+        assert_eq!(Value::Object(replaced).to_string(), expected);
+        assert_eq!(untouched, value);
     }
 
     #[test]

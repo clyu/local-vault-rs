@@ -12,6 +12,7 @@ use crate::http::{
 };
 use crate::json::{JsonObject, is_safe_segment, with_fields};
 use crate::merge::DeviceDescription;
+use crate::organizations::profile_without_organizations;
 use crate::platform::{LogLevel, Platform, new_uuid};
 use crate::store::{KEY_REVISION_DATE, LocalVaultStore, ReadError, ReadVault, as_strs};
 use crate::token::user_id_of_access_token;
@@ -407,7 +408,10 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
             R::GetFolder(id) => Ok(get_folder(vault, id)),
             R::UpdateFolder(id) => self.update_folder(user_id, vault, id, request).await,
             R::DeleteFolder(id) => self.delete_folder(user_id, vault, id).await,
-            R::Profile => Ok(ok_response(&Value::Object(profile(vault)))),
+            R::Profile => {
+                let profile = profile_without_organizations(&profile(vault));
+                Ok(ok_response(&Value::Object(profile)))
+            }
             R::VerifyPassword => verify_password(vault, request),
             R::ChangePassword => self.change_password(user_id, vault, request).await,
             R::UpdateKdf => self.update_kdf(user_id, vault, request).await,

@@ -28,6 +28,7 @@ mod json;
 mod kdf;
 mod memory_fs;
 mod merge;
+mod organizations;
 mod platform;
 mod server;
 mod store;

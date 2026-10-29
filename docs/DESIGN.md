@@ -341,7 +341,8 @@ a newer one of the device that wrote it.
 | Check the master password | The client sends the same password hash it sends to a server. It is checked against a salted verifier in the vault, which is the counterpart of the hash a server stores. |
 | Find the account that logs in | The account directories are searched for the ones with that email address. They are gone through in the order of their IDs, and the first one that the master password is right for is logged in to. Nothing is registered per device, so a device that is given a vault folder can log in to the accounts in it. |
 | Issue tokens | An access token in the shape of the JWT that the identity server issues, carrying the account ID, and a refresh token. Neither is signed, and they are valid for years: they never leave the process, and what they give access to is encrypted with keys they do not hold. |
-| Return the vault | The `sync` part of the vault, put together from the files of every device, is the body of the response to `GET /sync`. |
+| Return the vault | The `sync` part of the vault, put together from the files of every device, is the body of the response to `GET /sync`, without what it says about organizations (below). |
+| Tell the client which organizations the account is in | None: an account is never in an organization, and has no provider. Whoever can write to the vault folder can still put an organization in a file, with its key encrypted with the public key of the account, which the folder holds. A client that is told about it would take its key in, decrypt its items, offer to put new items in it, apply its policies, and send the key of the account to its Key Connector. So every response that has the vault, the profile or an item has them as an account that was never in an organization does: no organizations, providers, collections or policies, no Key Connector, no master password that an administrator reset, and every item in no organization, which a client cannot decrypt if it was encrypted with the key of one. A field is replaced in whatever case its key is written in, as a client may read it by another case than the server writes it in. The files are left as they are. |
 | Store a change | The vault is read and changed as a whole, and what changed is written to the file of the device. |
 | Refuse to overwrite a newer item | An item is only replaced if the revision date that the client knows it by is the one in the vault, within a second. |
 | Refuse an item of another account | A request that stores an item says in `encryptedFor` which account the client encrypted it for. If that is not the account of the token, the request is refused, as the item could not be decrypted in the vault that it would be stored in. One such item refuses a whole import. |
@@ -546,7 +547,10 @@ file system and the setting for the vault folder. A workable order:
   email address, the name, the master password hint, how many items there are and when they
   changed, and the chance to guess the master password offline. A hosted server keeps this
   behind its own defenses; a synced folder may not. A strong master password and KDF settings
-  matter more here than with a server.
+  matter more here than with a server. Whoever can write to it can also do what a server can do
+  to a vault: delete items, bring back older versions of them, or keep the account from being
+  used. What a server could give a client to take in, an organization, is not handed on (see
+  [How each job of the server is done](#how-each-job-of-the-server-is-done)).
 - **The email address is only a label.** Nobody verifies it. It serves to find the account in
   the folder at login.
 - **Two accounts can have the same email address.** Registration only looks at the accounts

@@ -212,6 +212,14 @@ already has for reading that response reads a vault as well. The parts of it tha
 
 An account is always reported as premium, as there is no server to buy a subscription from.
 
+An account is never in an organization. Whatever a file says about organizations is not handed to
+a client, as whoever can write to the vault folder could otherwise put the account in one of their
+own: `collections`, `policies` and `policiesNew` are returned empty, and so are `organizations`,
+`organizationsNew`, `providers` and `providerOrganizations` of `profile`, its `usesKeyConnector`
+and `forcePasswordReset` are `false`, and the `organizationId` of an item is `null` and its
+`collectionIds` empty. Each of them is replaced in whatever case its key is written in, if a file
+has it, as a client may read a field by another case. The file itself is left as it is.
+
 ### account.masterPasswordVerifier
 
 A client never stores or sends the master password. To log in it derives a hash from it, the way

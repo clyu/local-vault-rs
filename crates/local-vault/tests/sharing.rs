@@ -80,6 +80,70 @@ fn the_fields_of_a_vault_that_are_not_known_are_kept_as_they_are() {
 }
 
 #[test]
+fn what_a_file_says_about_organizations_is_not_returned() {
+    let (client, fs) = browser();
+    let (token, user_id) = client.register_and_log_in();
+    let mine = json!({"type": 1, "name": "2.mine"});
+    let mine = body(&client.send("POST", "ciphers", &token, mine));
+    let cipher_path = format!("ciphers/{}", mine["id"].as_str().unwrap());
+    // Whoever can write to the vault folder puts the account in an organization of theirs, with
+    // its key encrypted with the public key of the account, and the item in it.
+    let organization = "11111111-2222-4333-8444-555555555555";
+    let membership = json!({
+        "id": organization,
+        "key": "4.organizationKey",
+        "keyConnectorEnabled": true,
+        "keyConnectorUrl": "https://key-connector.example.com",
+    });
+    let mut vault = vault_file(&fs, &user_id);
+    let sync = &mut vault["sync"];
+    sync["profile"]["organizations"] = json!([membership]);
+    // The browser extension reads this one first.
+    sync["profile"]["Organizations"] = json!([membership]);
+    sync["profile"]["providers"] = json!([{"id": "provider", "key": "4.providerKey"}]);
+    sync["profile"]["usesKeyConnector"] = json!(true);
+    sync["profile"]["forcePasswordReset"] = json!(true);
+    sync["collections"] = json!([{"id": "collection", "organizationId": organization}]);
+    sync["policies"] = json!([{"organizationId": organization, "type": 8, "enabled": true}]);
+    sync["ciphers"][0]["organizationId"] = json!(organization);
+    sync["ciphers"][0]["collectionIds"] = json!(["collection"]);
+    replace_vault_file(&fs, &user_id, &vault);
+    let two_hours_later = NOON + 120 * MINUTE;
+    client.platform.set_now(two_hours_later);
+
+    let synced = body(&client.get("sync", &token));
+    let profile = body(&client.get("accounts/profile", &token));
+    let cipher = body(&client.get(&cipher_path, &token));
+    let partial = json!({"folderId": null, "favorite": true});
+    let changed = body(&client.send("PUT", &format!("{cipher_path}/partial"), &token, partial));
+
+    for profile in [&synced["profile"], &profile] {
+        assert_eq!(profile["organizations"], json!([]));
+        assert_eq!(profile.get("Organizations"), None);
+        assert_eq!(profile["providers"], json!([]));
+        assert_eq!(profile["usesKeyConnector"], false);
+        assert_eq!(profile["forcePasswordReset"], false);
+    }
+    assert_eq!(synced["collections"], json!([]));
+    assert_eq!(synced["policies"], json!([]));
+    // The item is returned as one of the user, which a client cannot decrypt rather than take in.
+    for cipher in [&synced["ciphers"][0], &cipher, &changed] {
+        assert_eq!(cipher["name"], "2.mine");
+        assert_eq!(cipher["organizationId"], Value::Null);
+        assert_eq!(cipher["collectionIds"], json!([]));
+    }
+    // The files are left as they are, and the vault that was synced is the one on disk, so
+    // that it is not taken to have changed since.
+    let written = &vault_file(&fs, &user_id)["sync"];
+    assert_eq!(written["profile"]["Organizations"], json!([membership]));
+    assert_eq!(written["policies"].as_array().unwrap().len(), 1);
+    assert_eq!(written["ciphers"][0]["organizationId"], organization);
+    client.platform.set_now(two_hours_later + MINUTE);
+    client.get("sync", &token);
+    assert_eq!(revision_date(&client, &token), two_hours_later);
+}
+
+#[test]
 fn the_vault_is_read_from_its_backup_when_the_vault_file_is_not_complete() {
     let (client, fs) = browser();
     let (token, user_id) = client.register_and_log_in();
