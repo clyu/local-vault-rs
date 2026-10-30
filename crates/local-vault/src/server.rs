@@ -12,11 +12,11 @@ use crate::http::{
 };
 use crate::json::{JsonObject, is_safe_segment, with_fields};
 use crate::merge::DeviceDescription;
-use crate::organizations::profile_without_organizations;
 use crate::platform::{LogLevel, Platform, new_uuid};
 use crate::store::{KEY_REVISION_DATE, LocalVaultStore, ReadError, ReadVault, as_strs};
 use crate::token::bearer_of_access_token;
 use crate::vault::{ATTACHMENTS_PATH, get_attachment, get_cipher, get_folder, renew_attachment};
+use crate::withheld::{Returned, withhold};
 
 /// The version of the Bitwarden server that the local server says it is.
 const SERVER_VERSION: &str = "2026.9.0";
@@ -207,6 +207,58 @@ enum AccountRoute<'a> {
     Empty,
 }
 
+impl AccountRoute<'_> {
+    /// What of the vault the response has, which tells what is left out of it (see `withheld`).
+    /// Every route is named, so that a route cannot be added without saying it.
+    fn returned(&self) -> Returned {
+        use AccountRoute as R;
+        match self {
+            R::Sync => Returned::Vault,
+            R::Profile => Returned::Profile,
+            R::CreateCipher
+            | R::CreateCipherWithCollections
+            | R::GetCipher(_)
+            | R::UpdateCipher(_)
+            | R::UpdateCipherPartially(_)
+            | R::RestoreCipher(_)
+            | R::ArchiveCipher(..) => Returned::Cipher,
+            R::RestoreCiphers | R::ArchiveCiphers(_) => Returned::Ciphers,
+            R::CreateAttachment(_) | R::RenewAttachment(..) => {
+                Returned::CipherUnder("cipherResponse")
+            }
+            R::DeleteAttachment(..) => Returned::CipherUnder("cipher"),
+            // Folders, attachments and devices, which a client reads nothing of organizations
+            // or domains from, or nothing of the vault at all.
+            R::GetAttachment(..)
+            | R::CreateFolder
+            | R::GetFolder(_)
+            | R::UpdateFolder(_)
+            | R::LocalVaultDevices
+            | R::RevisionDate
+            | R::ImportCiphers
+            | R::Purge
+            | R::DeleteCiphers
+            | R::SoftDeleteCiphers
+            | R::MoveCiphers
+            | R::DeleteCipher(_)
+            | R::SoftDeleteCipher(_)
+            | R::DeleteFolders
+            | R::DeleteAllFolders
+            | R::DeleteFolder(_)
+            | R::VerifyPassword
+            | R::ChangePassword
+            | R::UpdateKdf
+            | R::RecordUserKeyId
+            | R::RotateUserAccountKeys
+            | R::DeleteAccount
+            | R::RetireLocalVaultDevice(_)
+            | R::Constant(_)
+            | R::EmptyList
+            | R::Empty => Returned::Nothing,
+        }
+    }
+}
+
 impl<F: FileSystem, P: Platform> LocalServer<F, P> {
     /// A local server on the vault folder that the file system reaches, for the device with the
     /// ID, the name and the type.
@@ -355,8 +407,13 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
         if bearer.user_key != user_key_rotation(&vault) {
             return Ok(unauthorized_response());
         }
-        self.run(route, &bearer.user_id, &vault, request, state)
-            .await
+        let returned = route.returned();
+        let response = self
+            .run(route, &bearer.user_id, &vault, request, state)
+            .await?;
+        // The one place where what a file says about organizations and domains is left out of
+        // what a client is told (see `withheld`).
+        Ok(withhold(returned, response))
     }
 
     async fn run(
@@ -418,10 +475,7 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
             R::GetFolder(id) => Ok(get_folder(vault, id)),
             R::UpdateFolder(id) => self.update_folder(user_id, vault, id, request).await,
             R::DeleteFolder(id) => self.delete_folder(user_id, vault, id).await,
-            R::Profile => {
-                let profile = profile_without_organizations(&profile(vault));
-                Ok(ok_response(&Value::Object(profile)))
-            }
+            R::Profile => Ok(ok_response(&Value::Object(profile(vault)))),
             R::VerifyPassword => verify_password(vault, request),
             R::ChangePassword => self.change_password(user_id, vault, request).await,
             R::UpdateKdf => self.update_kdf(user_id, vault, request).await,

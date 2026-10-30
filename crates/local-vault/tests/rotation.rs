@@ -158,6 +158,8 @@ fn a_rotation_replaces_what_the_user_key_encrypts_and_the_master_password() {
     );
     // A client that does not know of rotated keys leaves the file alone.
     let file = vault_file(&fs, &user_id);
+    // Every field that the rotation wrote is returned.
+    assert_eq!(after, file["sync"]);
     assert_eq!(file["version"], 4);
     let rotation = json!({"at": NOON + MINUTE, "by": DEVICE});
     assert_eq!(file["account"]["userKeyRotation"], rotation);

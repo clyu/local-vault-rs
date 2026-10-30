@@ -28,7 +28,6 @@ mod json;
 mod kdf;
 mod memory_fs;
 mod merge;
-mod organizations;
 mod platform;
 mod rotation;
 mod server;
@@ -36,6 +35,7 @@ mod store;
 mod token;
 mod vault;
 mod verifier;
+mod withheld;
 
 pub use conformance::check_file_system;
 pub use exchange::{

@@ -22,6 +22,7 @@ use crate::token::{
     AccessTokenClaims, bearer_of_refresh_token, create_access_token, create_refresh_token,
 };
 use crate::verifier::{create_verifier, matches_verifier};
+use crate::withheld::no_equivalent_domains;
 
 const TOKEN_LIFETIME_SECONDS: i64 = 5 * 365 * 24 * 60 * 60;
 const DEFAULT_KDF_ITERATIONS: i64 = 600_000;
@@ -129,11 +130,6 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
             "providerOrganizations": [],
             "object": "profile",
         });
-        let domains = json!({
-            "equivalentDomains": [],
-            "globalEquivalentDomains": [],
-            "object": "domains",
-        });
         let sync = json!({
             "profile": profile,
             "folders": [],
@@ -141,7 +137,7 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
             "ciphers": [],
             "policies": [],
             "sends": [],
-            "domains": domains,
+            "domains": no_equivalent_domains(),
             "userDecryption": {"masterPasswordUnlock": unlock},
             "object": "sync",
         });

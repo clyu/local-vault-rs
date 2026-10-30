@@ -77,6 +77,54 @@ fn the_fields_of_a_vault_that_are_not_known_are_kept_as_they_are() {
     assert_eq!(written["sync"]["profile"]["newField"], "kept");
     assert_eq!(written["sync"]["newList"], json!([1]));
     assert_eq!(written["sync"]["folders"].as_array().unwrap().len(), 1);
+    // What the local server does not write is not returned, as whoever can write to the vault
+    // folder could have put it there.
+    let synced = body(&client.get("sync", &token));
+    assert_eq!(synced["profile"].get("newField"), None);
+    assert_eq!(synced.get("newList"), None);
+}
+
+#[test]
+fn a_vault_that_the_local_server_wrote_is_returned_whole() {
+    let (client, fs) = browser();
+    let (token, user_id) = client.register_and_log_in();
+    let record = json!({"userKeyId": "user-key-id"});
+    let path = "accounts/key-management/user-key-id";
+    assert_eq!(client.send("POST", path, &token, record).code, 200);
+    let kdf = json!({"kdfType": 0, "iterations": 600000});
+    let change = json!({
+        "masterPasswordHash": PASSWORD_HASH,
+        "masterPasswordHint": "2.hint",
+        "authenticationData": {
+            "salt": EMAIL,
+            "kdf": kdf,
+            "masterPasswordAuthenticationHash": "bmV3LWhhc2g=",
+        },
+        "unlockData": {"salt": EMAIL, "kdf": kdf, "masterKeyWrappedUserKey": "2.newUserKey"},
+    });
+    assert_eq!(
+        client
+            .send("POST", "accounts/password", &token, change)
+            .code,
+        200
+    );
+    client.send("POST", "folders", &token, json!({"name": "2.folder"}));
+    client.send(
+        "POST",
+        "ciphers",
+        &token,
+        json!({"type": 1, "name": "2.item"}),
+    );
+
+    let synced = body(&client.get("sync", &token));
+    let profile = body(&client.get("accounts/profile", &token));
+
+    // Every field that the server writes is one that it returns.
+    let written = &vault_file(&fs, &user_id)["sync"];
+    assert_eq!(&synced, written);
+    assert_eq!(&profile, &written["profile"]);
+    assert_eq!(synced["profile"]["masterPasswordHint"], "2.hint");
+    assert_eq!(synced["userDecryption"]["userKeyId"], "user-key-id");
 }
 
 #[test]
@@ -141,6 +189,101 @@ fn what_a_file_says_about_organizations_is_not_returned() {
     client.platform.set_now(two_hours_later + MINUTE);
     client.get("sync", &token);
     assert_eq!(revision_date(&client, &token), two_hours_later);
+}
+
+#[test]
+fn equivalent_domains_that_a_file_has_are_not_returned() {
+    let (client, fs) = browser();
+    let (token, user_id) = client.register_and_log_in();
+    let registered = body(&client.get("sync", &token))["domains"].clone();
+    // Whoever can write to the vault folder has a site of their own taken for the bank of the
+    // user, which a client would then offer the login for the bank on.
+    let same_site = json!(["bank.example", "attacker.example"]);
+    let global = json!({"type": 0, "domains": same_site, "excluded": false});
+    let mut vault = vault_file(&fs, &user_id);
+    let domains = &mut vault["sync"]["domains"];
+    domains["equivalentDomains"] = json!([same_site]);
+    domains["globalEquivalentDomains"] = json!([global]);
+    // The browser extension reads this one first.
+    vault["sync"]["Domains"] = json!({"equivalentDomains": [same_site]});
+    replace_vault_file(&fs, &user_id, &vault);
+
+    let synced = body(&client.get("sync", &token));
+
+    let none = json!({"equivalentDomains": [], "globalEquivalentDomains": [], "object": "domains"});
+    assert_eq!(registered, none);
+    assert_eq!(synced["domains"], none);
+    assert_eq!(synced.get("Domains"), None);
+    let written = &vault_file(&fs, &user_id)["sync"];
+    assert_eq!(written["domains"]["equivalentDomains"], json!([same_site]));
+}
+
+#[test]
+fn no_response_that_has_the_vault_in_it_has_what_a_file_says_about_organizations_or_domains() {
+    let (client, fs) = browser();
+    let (token, user_id) = client.register_and_log_in();
+    let mine = json!({"type": 1, "name": "2.mine"});
+    let mine = body(&client.send("POST", "ciphers", &token, mine));
+    let cipher_path = format!("ciphers/{}", mine["id"].as_str().unwrap());
+    let attachment = json!({"fileName": "2.fileName", "key": "2.key", "fileSize": 1});
+    let upload_path = format!("{cipher_path}/attachment/v2");
+    let upload = body(&client.send("POST", &upload_path, &token, attachment.clone()));
+    let attachment_id = upload["attachmentId"].as_str().unwrap();
+    let attachment_path = format!("{cipher_path}/attachment/{attachment_id}");
+    // Whoever can write to the vault folder puts the account and the item in an organization of
+    // theirs, and has a site of theirs taken for another.
+    let organization = "11111111-2222-4333-8444-555555555555";
+    let collection = "66666666-7777-4888-8999-000000000000";
+    let site = "attacker.example";
+    let mut vault = vault_file(&fs, &user_id);
+    let sync = &mut vault["sync"];
+    sync["profile"]["Organizations"] = json!([{"id": organization, "key": "4.organizationKey"}]);
+    sync["profile"]["providers"] = json!([{"id": organization, "key": "4.providerKey"}]);
+    sync["collections"] = json!([{"id": collection, "organizationId": organization}]);
+    sync["policies"] = json!([{"organizationId": organization, "type": 8, "enabled": true}]);
+    sync["domains"]["equivalentDomains"] = json!([["bank.example", site]]);
+    sync["ciphers"][0]["OrganizationId"] = json!(organization);
+    sync["ciphers"][0]["collectionIds"] = json!([collection]);
+    replace_vault_file(&fs, &user_id, &vault);
+    let ids = json!({"ids": [mine["id"]]});
+    let partial = json!({"folderId": null, "favorite": true});
+
+    // Every route whose response has the vault, the profile or an item in it, as the file has
+    // them: the items that a request creates or replaces are those of the request.
+    let requests = [
+        ("GET", "sync".to_owned(), None),
+        ("GET", "accounts/profile".to_owned(), None),
+        ("GET", cipher_path.clone(), None),
+        ("GET", format!("{cipher_path}/details"), None),
+        ("PUT", format!("{cipher_path}/partial"), Some(partial)),
+        ("PUT", format!("{cipher_path}/restore"), None),
+        ("PUT", "ciphers/restore".to_owned(), Some(ids.clone())),
+        ("PUT", format!("{cipher_path}/archive"), None),
+        ("PUT", format!("{cipher_path}/unarchive"), None),
+        ("PUT", "ciphers/archive".to_owned(), Some(ids.clone())),
+        ("PUT", "ciphers/unarchive".to_owned(), Some(ids)),
+        ("GET", attachment_path.clone(), None),
+        ("GET", format!("{attachment_path}/renew"), None),
+        ("POST", upload_path, Some(attachment)),
+        ("DELETE", attachment_path, None),
+    ];
+    for (method, path, value) in requests {
+        let response = match value {
+            Some(value) => client.send(method, &path, &token, value),
+            None => client.call(method, &path, &token),
+        };
+
+        let json = response.json().unwrap_or_default();
+        assert_eq!(response.code, 200, "{method} {path}: {json}");
+        for said in [organization, collection, site] {
+            assert!(!json.contains(said), "{method} {path}: {json}");
+        }
+    }
+    // The file still says all of it, so every response was made from what it says.
+    let written = &vault_file(&fs, &user_id)["sync"];
+    assert_eq!(written["ciphers"][0]["OrganizationId"], organization);
+    assert_eq!(written["profile"]["Organizations"][0]["id"], organization);
+    assert_eq!(written["domains"]["equivalentDomains"][0][1], site);
 }
 
 #[test]

@@ -15,7 +15,6 @@ use crate::json::{
     JsonObject, element, eq_ignore_case, int, into_object, obj, objects, string, strings, text,
     with_fields, without_fields,
 };
-use crate::organizations::{cipher_without_organization, sync_without_organizations};
 use crate::platform::Platform;
 use crate::server::{LocalServer, Outcome, State};
 use crate::store::{KEY_REVISION_DATE, KEY_SYNC, ReadVault};
@@ -61,20 +60,18 @@ const ATTACHMENT_KEY_LEFT_OUT_MESSAGE: &str =
     "The keys of some attachments were left out of the rotation of the user key.";
 
 impl<F: FileSystem, P: Platform> LocalServer<F, P> {
-    /// Returns the whole vault, without what it says about organizations, and remembers what the
-    /// vault was.
+    /// Returns the whole vault, and remembers what it returned: the vault as it is on disk, which
+    /// the vault is compared with to tell whether it changed. What it says about organizations and
+    /// equivalent domains is left out on the way to the client (see `withheld`).
     pub(crate) fn sync(
         &self,
         user_id: &str,
         vault: &JsonObject,
         state: &mut State,
     ) -> LocalResponse {
-        let sync = obj(vault, KEY_SYNC).cloned().unwrap_or_default();
-        let response = ok_response(&Value::Object(sync_without_organizations(&sync)));
-        // As it is on disk, which the vault is compared with to tell whether it changed.
-        state
-            .synced_vaults
-            .insert(user_id.to_owned(), Value::Object(sync));
+        let sync = Value::Object(obj(vault, KEY_SYNC).cloned().unwrap_or_default());
+        let response = ok_response(&sync);
+        state.synced_vaults.insert(user_id.to_owned(), sync);
         response
     }
 
@@ -146,7 +143,7 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
         let cipher = to_cipher(&body, &id, Some(&existing), &self.now());
         let updated = with_item(vault, CIPHERS, &cipher);
         self.save(user_id, vault, &updated).await?;
-        Ok(cipher_response(&cipher))
+        Ok(ok_response(&Value::Object(cipher)))
     }
 
     /// Changes what an item has for the account only: the folder that it is in, and whether it
@@ -174,7 +171,7 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
         );
         let updated = with_item(vault, CIPHERS, &cipher);
         self.save(user_id, vault, &updated).await?;
-        Ok(cipher_response(&cipher))
+        Ok(ok_response(&Value::Object(cipher)))
     }
 
     /// Puts items in a folder, or in none.
@@ -458,8 +455,7 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
         let updated_cipher = with_fields(&cipher, [("attachments", array_or_null(attachments))]);
         let updated = with_item(vault, CIPHERS, &updated_cipher);
         self.save(user_id, vault, &updated).await?;
-        let cipher = cipher_without_organization(&updated_cipher);
-        Ok(ok_response(&json!({"cipher": cipher})))
+        Ok(ok_response(&json!({"cipher": updated_cipher})))
     }
 
     /// Stores or returns the encrypted content of an attachment, at the address that
@@ -602,7 +598,7 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
         let cipher = to_cipher(body, &self.new_id(), None, &self.now());
         let updated = with_item(vault, CIPHERS, &cipher);
         self.save(user_id, vault, &updated).await?;
-        Ok(cipher_response(&cipher))
+        Ok(ok_response(&Value::Object(cipher)))
     }
 
     async fn soft_delete(&self, user_id: &str, vault: &ReadVault, ids: &[String]) -> Outcome {
@@ -658,7 +654,7 @@ impl<F: FileSystem, P: Platform> LocalServer<F, P> {
 /// Returns an item of the vault.
 pub(crate) fn get_cipher(vault: &JsonObject, cipher_id: &str) -> LocalResponse {
     match item(vault, CIPHERS, cipher_id) {
-        Some(cipher) => cipher_response(&cipher),
+        Some(cipher) => ok_response(&Value::Object(cipher)),
         None => not_found_response(),
     }
 }
@@ -715,7 +711,7 @@ fn upload_response(
         "attachmentId": attachment_id,
         "url": attachment_url(user_id, cipher_id, attachment_id),
         "fileUploadType": FILE_UPLOAD_TYPE_AZURE,
-        "cipherResponse": cipher_without_organization(&cipher),
+        "cipherResponse": cipher,
         "object": "attachment-fileUpload",
     });
     ok_response(&upload)
@@ -903,25 +899,13 @@ fn is_out_of_date(cipher: &JsonObject, last_known_revision_date: Option<&str>) -
     }
 }
 
-/// The response with an item, as an item of the user: whatever a file of the vault says about an
-/// organization of the item is left out of what a client is told (see `organizations`).
-fn cipher_response(cipher: &JsonObject) -> LocalResponse {
-    ok_response(&Value::Object(cipher_without_organization(cipher)))
+fn list_of(items: Vec<JsonObject>) -> LocalResponse {
+    list_response(items.into_iter().map(Value::Object).collect())
 }
 
-/// The response with a list of items, as items of the user (see [`cipher_response`]).
-fn list_of(ciphers: Vec<JsonObject>) -> LocalResponse {
-    let ciphers = ciphers
-        .iter()
-        .map(|cipher| Value::Object(cipher_without_organization(cipher)))
-        .collect();
-    list_response(ciphers)
-}
-
-/// The response with the first of the items, as an item of the user (see [`cipher_response`]).
-fn first_or_not_found(ciphers: Vec<JsonObject>) -> LocalResponse {
-    match ciphers.first() {
-        Some(cipher) => cipher_response(cipher),
+fn first_or_not_found(items: Vec<JsonObject>) -> LocalResponse {
+    match items.into_iter().next() {
+        Some(item) => ok_response(&Value::Object(item)),
         None => not_found_response(),
     }
 }

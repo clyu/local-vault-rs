@@ -220,13 +220,24 @@ already has for reading that response reads a vault as well. The parts of it tha
 
 An account is always reported as premium, as there is no server to buy a subscription from.
 
+Of `sync`, `profile` and `userDecryption`, which only the local server writes, only the fields
+that it writes are returned to a client, under the keys that it writes them under: those that a
+registration writes, and `userKeyId`. A field that a file has besides them, or under a key in
+another case, is kept in the file and not returned, as whoever can write to the vault folder could
+have put it there for a client to take in.
+
 An account is never in an organization. Whatever a file says about organizations is not handed to
 a client, as whoever can write to the vault folder could otherwise put the account in one of their
-own: `collections`, `policies` and `policiesNew` are returned empty, and so are `organizations`,
-`organizationsNew`, `providers` and `providerOrganizations` of `profile`, its `usesKeyConnector`
-and `forcePasswordReset` are `false`, and the `organizationId` of an item is `null` and its
-`collectionIds` empty. Each of them is replaced in whatever case its key is written in, if a file
-has it, as a client may read a field by another case. The file itself is left as it is.
+own: `collections` and `policies` are returned empty, and so are `organizations`, `providers` and
+`providerOrganizations` of `profile`, its `usesKeyConnector` and `forcePasswordReset` are `false`,
+and the `organizationId` of an item is `null` and its `collectionIds` empty. Those of an item are
+replaced in whatever case their keys are written in, if a file has them, as a client may read a
+field by another case. The file itself is left as it is.
+
+No domains are taken for the same site either. `domains` is returned the way a registration
+writes it, with `equivalentDomains` and `globalEquivalentDomains` empty, whatever a file has, as
+whoever can write to the vault folder could otherwise have a site of their own taken for another,
+which a client would then offer the logins of the other on. The file is left as it is.
 
 ### account.masterPasswordVerifier
 
