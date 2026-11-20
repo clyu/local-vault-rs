@@ -63,16 +63,6 @@ pub struct FlagRule {
 /// The feature flags that the local vault counts on to be off.
 pub const FLAGS_THAT_MUST_BE_OFF: &[FlagRule] = &[
     FlagRule {
-        key: "pm-27632-cipher-crud-operations-to-sdk",
-        clients: &[ClientKind::Browser],
-        reason: "the SDK saves, changes and deletes items",
-    },
-    FlagRule {
-        key: "pm-28192-cipher-attachment-ops-to-sdk",
-        clients: &[ClientKind::Browser],
-        reason: "the SDK makes the requests for attachments",
-    },
-    FlagRule {
         key: "pm-27060-password-prelogin-from-sdk",
         clients: &[ClientKind::Android, ClientKind::Browser],
         reason: "the SDK asks how a master key is derived",
